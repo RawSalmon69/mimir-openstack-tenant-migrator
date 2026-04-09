@@ -1,0 +1,412 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mimir-keystone-authz-plugin
+  namespace: monitoring
+data:
+  mimir-keystone-authz.lua: |
+    local core = require("apisix.core")
+    local http = require("resty.http")
+    local cjson = require("cjson.safe")
+    local lrucache = require("resty.lrucache")
+    
+    local ngx = ngx
+    local cache = lrucache.new(1000) -- Create an LRU cache with 1000 entries
+    local shm = ngx.shared.mimir_keystone_token_cache
+    
+    local plugin_name = "mimir-keystone-authz"
+    
+    local schema = {
+        type = "object",
+        properties = {
+            keystone_url = { type = "string" },
+            allowed_roles = {
+                type = "array",
+                items = { type = "string" }
+            },
+            token_cache_ttl = {
+                type = "number",
+                default = 60
+            },
+            --     admin_role = {
+            --         type = "array",
+            --         items = { type = "string" }
+            -- }
+        },
+        required = {
+            "keystone_url",
+            "allowed_roles",
+            -- "admin_role"
+        }
+    }
+    
+    local _M = {
+        version = 0.1,
+        priority = 2510, -- Ensure it runs early in the request phase
+        name = plugin_name,
+        schema = schema
+    }
+    
+    local function parse_iso8601_time(iso_time_str)
+        -- Remove fractional seconds and 'Z' for simpler parsing
+        local simplified_time_str = iso_time_str:gsub("%.%d+Z$", "Z")
+    
+        local year, month, day, hour, minute, second = simplified_time_str:match(
+            "(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)Z")
+    
+        if year and month and day and hour and minute and second then
+            local time_table = {
+                year = tonumber(year),
+                month = tonumber(month),
+                day = tonumber(day),
+                hour = tonumber(hour),
+                min = tonumber(minute),
+                sec = tonumber(second),
+                isdst = false, -- UTC
+                utc = true,
+            }
+            local unixtime = os.time(time_table)
+            return unixtime
+        else
+            return nil
+        end
+    end
+    
+    local function check_app_creds(conf, auth_header)
+        -- =========================================================
+        -- 1. Check L1 Cache (LRU)
+        -- =========================================================
+        local cached_creds = cache:get(auth_header)
+        if cached_creds then
+            local cached_data = cjson.decode(cached_creds)
+            if cached_data.expiry > ngx.time() then
+                core.log.debug("AppCreds L1 LRU cache hit")
+                return true, cached_data.project_id
+            else
+                core.log.debug("AppCreds L1 LRU cache hit but expired")
+                cache:delete(auth_header)
+            end
+        end
+    
+        -- =========================================================
+        -- 2. Check L2 Cache (Shared Dictionary)
+        -- =========================================================
+        local shm_cached_creds = shm:get(auth_header)
+        if shm_cached_creds then
+            local shm_cached_data = cjson.decode(shm_cached_creds)
+            if shm_cached_data.expiry > ngx.time() then
+                core.log.debug("AppCreds L2 shared DICT cache hit")
+                -- Promote to L1 for faster future access
+                cache:set(auth_header, shm_cached_creds, conf.token_cache_ttl)
+                return true, shm_cached_data.project_id
+            else
+                core.log.debug("AppCreds L2 shared DICT cache hit but expired")
+                shm:delete(auth_header)
+            end
+        end
+    
+        -- =========================================================
+        -- 3. Cache Miss - Proceed with Parsing and HTTP Request
+        -- =========================================================
+        core.log.debug("AppCreds L1 & L2 cache miss, requesting Keystone")
+    
+        local decoded_auth = ngx.decode_base64(auth_header:match("Basic%s(.+)"))
+        if not decoded_auth then
+            core.log.debug("Invalid Basic Auth Header")
+            return false, "Invalid Basic Auth Header"
+        end
+    
+        local app_id, app_secret = decoded_auth:match("([^:]+):(.+)")
+    
+        if not app_id or not app_secret then
+            core.log.debug("Invalid application credentials format")
+            return false, "Invalid application credentials format"
+        end
+    
+        local httpc = http.new()
+        local auth_data = {
+            auth = {
+                identity = {
+                    methods = { "application_credential" },
+                    application_credential = {
+                        id = app_id,
+                        secret = app_secret,
+                    },
+                },
+            }
+        }
+        
+        local res, err = httpc:request_uri(conf.keystone_url .. "/v3/auth/tokens", {
+            method = "POST",
+            body = cjson.encode(auth_data),
+            headers = {
+                ["Content-Type"] = "application/json"
+            },
+            ssl_verify = false
+        })
+    
+        if not res then
+            core.log.debug("Failed to connect to Keystone: ", err)
+            return false, "Failed to connect to Keystone."
+        end
+    
+        local status = res.status
+        local body = res.body
+    
+        httpc:close()
+    
+        if status == 201 then
+            local decoded_body = cjson.decode(body)
+            
+            -- Validate Response Structure
+            if not decoded_body or not decoded_body.token or not decoded_body.token.project then
+                 core.log.debug("Invalid response format from Keystone")
+                 return false, "Invalid response from Keystone"
+            end
+    
+            local project_id = decoded_body.token.project.id
+            local expires_at = decoded_body.token.expires_at
+    
+            if project_id then
+                core.log.info("Application credentials validated, project_id: " .. project_id)
+    
+                -- =========================================================
+                -- 4. Set L1 and L2 Caches
+                -- =========================================================
+                if expires_at then
+                    local expiry_timestamp = parse_iso8601_time(expires_at)
+                    
+                    -- Prepare cache data
+                    local cache_data = {
+                        project_id = project_id,
+                        expiry = expiry_timestamp
+                    }
+                    local encoded_cache_data = cjson.encode(cache_data)
+    
+                    -- Save to caches
+                    cache:set(auth_header, encoded_cache_data, conf.token_cache_ttl)
+                    shm:set(auth_header, encoded_cache_data, conf.token_cache_ttl)
+                    
+                    core.log.debug("Cached App Creds result for TTL: ", conf.token_cache_ttl)
+                else
+                    core.log.warn("Keystone response missing expires_at, skipping cache")
+                end
+    
+                return true, project_id
+            else
+                core.log.debug("Project ID not found in Keystone response: ", body)
+                return false, "Project ID not found in Keystone response."
+            end
+        elseif status == 404 then
+            return false, "Project ID not found in Keystone response."
+        elseif status == 401 then
+            return false, "Invalid application credentials."
+        else
+            core.log.debug("Keystone returned unexpected status: ", status, ", body: ", body)
+            return false, "Keystone returned an unexpected status."
+        end
+    end
+    
+    -- Function to validate the token with OpenStack Keystone
+    local function validate_token(keystone_url, token, allowed_roles, token_cache_ttl)
+        local cached_token = cache:get(token)
+        if cached_token then
+            local cached_data = cjson.decode(cached_token)
+            if cached_data.expiry > ngx.time() then
+                core.log.debug("L1 LRU cache hit")
+                return true, cached_data.project_id, "Token validated from L1 cache."
+            else
+                core.log.debug("L1 LRU cache hit but expired")
+                cache:delete(token) -- Remove expired token
+            end
+        end
+        core.log.debug("L1 LRU cache miss")
+    
+        local shm_cached_token = shm:get(token)
+        if shm_cached_token then
+            local shm_cached_data = cjson.decode(shm_cached_token)
+            if shm_cached_data.expiry > ngx.time() then
+                core.log.debug("L2 shared DICT cache hit")
+                cache:set(token, shm_cached_token, token_cache_ttl)
+                return true, shm_cached_data.project_id, "Token validated from shared cache."
+            else
+                core.log.debug("L2 shared DICT cache hit but expired")
+                shm:delete(token)
+            end
+        end
+        core.log.debug("L2 shared DICT cache miss")
+    
+        local httpc = http.new()
+        local res, err = httpc:request_uri(keystone_url .. "/v3/auth/tokens", {
+            method = "GET",
+            headers = {
+                ["X-Auth-Token"] = token,
+                ["X-Subject-Token"] = token,
+                ["Content-Type"] = "application/json"
+            },
+            ssl_verify = false
+        })
+    
+        if not res then
+            core.log.info("Failed to reach Keystone: ", err)
+            return false, "Keystone request failed"
+        end
+    
+        if res.status ~= 200 then
+            core.log.info("Invalid Keystone token: ", res.status)
+            return false, "Invalid token"
+        end
+    
+        -- Parse JSON response
+        local body, err = cjson.decode(res.body)
+        if not body then
+            core.log.info("Failed to parse Keystone response: ", err)
+            return false, "Get response body failed"
+        end
+    
+    
+    
+        -- -- Extract project ID from response
+        local is_project_id = body.token and body.token.project and body.token.project.id
+        local project_id = body.token.project.id
+        if not is_project_id then
+            core.log.info("Project ID not found in Keystone response")
+            return false, "Get Project id failed"
+        end
+    
+        core.log.info("Extract project id from res body to :", project_id)
+    
+    
+        if not body or not body.token or not body.token.roles then
+            return false, "Missing role data"
+        end
+    
+        -- Convert allowed_roles list to a set for fast lookup
+        local allowed_roles_set = {}
+        for _, role in ipairs(allowed_roles) do
+            allowed_roles_set[role] = true
+            core.log.info("allowed_roles_set[" .. role .. "]: " .. tostring(allowed_roles_set[role]))
+        end
+    
+        -- local admin_roles_set = {}
+        -- for _, role in ipairs(admin_roles) do
+        --     admin_roles_set[role] = true
+        -- end
+    
+        -- Extract roles from response and check against allowed roles
+        local roles = body.token.roles
+    
+        -- for _, role_obj in ipairs(roles) do
+        --     local role_name = role_obj.name
+        --     core.log.info("Mapping role_name(admin_roles): "..role_name.." is "..tostring(admin_roles_set[role_name]))
+        --     if admin_roles_set[role_name] then
+        --         core.log.info("User has admin role: ", role_name, " - Setting X-GRAFANAAUTH-USER to 'admin'.")
+        --         return true, "admin"  -- Admin user
+        --     end
+        -- end
+    
+        for _, role_obj in ipairs(roles) do
+            local role_name = role_obj.name
+            core.log.info("Mapping role_name(allowed_roles): " .. role_name .. " is " ..
+                tostring(allowed_roles_set[role_name]))
+            if allowed_roles_set[role_name] then
+                local expires_at = body.token.expires_at
+                core.log.debug("body.token.expires_at: " .. expires_at)
+                local expiry_timestamp = parse_iso8601_time(expires_at)
+                core.log.debug("expiry_timestamp: " .. expiry_timestamp)
+                local cache_ttl = token_cache_ttl
+    
+                local cache_data = {
+                    project_id = project_id,
+                    expiry = expiry_timestamp,
+                }
+    
+                core.log.info("User has allowed role: ", role_name, " - Setting X-GRAFANAAUTH-USER to ", project_id, ".")
+                local encoded_cache_data = cjson.encode(cache_data)
+                cache:set(token, encoded_cache_data, cache_ttl)
+                shm:set(token, encoded_cache_data, cache_ttl)
+                return true, project_id -- User has a required role, return project ID
+            end
+        end
+    
+        -- return res.status == 200
+        return false, "User does not have the required role"
+    end
+    
+    function _M.access(conf, ctx)
+        -- local redirect_url = conf.redirect_url
+        -- local grafana_login_uri = conf.grafana_login_uri
+    
+        -- Extract cookie from the request
+        local cookie = ctx.var.http_cookie
+        local header_x_auth_token = core.request.header(ctx, "X-Auth-Token")
+        local header_authorization = core.request.header(ctx, "Authorization")
+    
+        if not header_x_auth_token and not cookie and not header_authorization then
+            core.log.debug("Access with no access token provide")
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: No access token provided.")
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+    
+            -- core.log.info("Missing authentication cookie, redirecting...")
+            -- return ngx.redirect(redirect_url, ngx.HTTP_MOVED_TEMPORARILY)
+        end
+    
+        local token = ""
+        local valid, result = false, ""
+    
+        if header_authorization then
+            valid, result = check_app_creds(conf, header_authorization)
+        end
+    
+        if header_x_auth_token then
+            token = header_x_auth_token
+        end
+    
+        if cookie then
+            -- Extract token from cookie (assuming it's stored as `token=value`)
+            token = string.match(cookie, "token=([^;]+)")
+        end
+    
+        if not token then
+            core.log.debug("Access but token cookie not found or empty.")
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: Token not found.")
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+    
+            -- core.log.info("Invalid authentication cookie, redirecting...")
+            -- return ngx.redirect(redirect_url, ngx.HTTP_MOVED_TEMPORARILY)
+        end
+    
+    
+        -- Remove existing X-GRAFANAAUTH-USER header from the original request (security)
+        -- core.request.set_header(ctx, "X-GRAFANAAUTH-USER", nil)
+    
+        -- Validate token and check roles
+        -- If Authorization header was present but app-creds failed (or no Authorization header),
+        -- fall through to token validation so X-Auth-Token / cookie can still succeed.
+        if not header_authorization or not valid then
+            if token and token ~= "" then
+                valid, result = validate_token(conf.keystone_url, token, conf.allowed_roles, conf.token_cache_ttl)
+            end
+        end
+    
+    
+        if not valid then
+            core.log.debug("Unauthorized access attempt.")
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: ", result)
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+    
+            -- core.log.info("Authentication failed, redirecting to login.. :", result)
+            -- return ngx.redirect(redirect_url, ngx.HTTP_MOVED_TEMPORARILY)
+        end
+    
+        -- Add Header
+        core.request.set_header(ctx, "X-Scope-OrgID", result)
+    
+        -- Allow request to proceed
+        core.log.info("User authenticated successfully as project id :", result)
+    end
+    
+    return _M

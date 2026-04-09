@@ -1,0 +1,269 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-keystone-authz-plugin
+  namespace: monitoring
+data:
+  grafana-keystone-authz.lua: |
+    local core = require("apisix.core")
+    local http = require("resty.http")
+    local cjson = require("cjson.safe")
+    local lrucache = require("resty.lrucache")
+    
+    local ngx = ngx
+    local cache = lrucache.new(1000) -- Create an LRU cache with 1000 entries
+    local shm = ngx.shared.grafana_keystone_token_cache
+    
+    local plugin_name = "grafana-keystone-authz"
+    
+    local schema = {
+        type = "object",
+        properties = {
+            keystone_url = { type = "string" },
+            redirect_url = { type = "string" },
+            allowed_roles = {
+                type = "array",
+                items = { type = "string" }
+            },
+            admin_role = {
+                type = "array",
+                items = { type = "string" }
+            },
+            token_cache_ttl = {
+                type = "number",
+                default = 60
+            },
+        },
+        required = {
+            "keystone_url",
+            "redirect_url",
+            "allowed_roles",
+            "admin_role"
+        }
+    }
+    
+    local _M = {
+        version = 0.1,
+        priority = 2500, -- Ensure it runs early in the request phase
+        name = plugin_name,
+        schema = schema
+    }
+    
+    local function parse_iso8601_time(iso_time_str)
+        -- Remove fractional seconds and 'Z' for simpler parsing
+        local simplified_time_str = iso_time_str:gsub("%.%d+Z$", "Z")
+        local year, month, day, hour, minute, second = simplified_time_str:match(
+            "(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)Z")
+    
+        if year and month and day and hour and minute and second then
+            local time_table = {
+                year = tonumber(year),
+                month = tonumber(month),
+                day = tonumber(day),
+                hour = tonumber(hour),
+                min = tonumber(minute),
+                sec = tonumber(second),
+                isdst = false, -- UTC
+                utc = true,
+            }
+            local unixtime = os.time(time_table)
+            return unixtime
+        else
+            return nil
+        end
+    end
+    
+    -- Function to validate the token with OpenStack Keystone
+    local function validate_token(keystone_url, token, allowed_roles, admin_roles, token_cache_ttl)
+        local cached_token = cache:get(token)
+        if cached_token then
+            local cached_data = cjson.decode(cached_token)
+            if cached_data.expiry > ngx.time() and cached_data.is_grafana_admin == false then
+                core.log.debug("L1 LRU cache hit")
+                return true, cached_data.project_id, "Token validated from L1 cache."
+            elseif cached_data.expiry > ngx.time() and cached_data.is_grafana_admin == true then
+                core.log.debug("L1 LRU cache hit, login as Grafana Admin")
+                return true, "admin", "Token validated from L1 cache."
+            else
+                core.log.debug("L1 LRU cache hit but expired")
+                cache:delete(token) -- Remove expired token
+            end
+        end
+        core.log.debug("L1 LRU cache miss")
+    
+        local shm_cached_token = shm:get(token)
+        if shm_cached_token then
+            local shm_cached_data = cjson.decode(shm_cached_token)
+            if shm_cached_data.expiry > ngx.time() and shm_cached_data.is_grafana_admin == false then
+                core.log.debug("L2 shared DICT cache hit")
+                cache:set(token, shm_cached_token, token_cache_ttl)
+                return true, shm_cached_data.project_id, "Token validated from shared cache."
+            elseif shm_cached_data.expiry > ngx.time() and shm_cached_data.is_grafana_admin == true then
+                core.log.debug("L1 LRU cache hit, login as Grafana Admin")
+                cache:set(token, shm_cached_token, token_cache_ttl)
+                return true, "admin", "Token validated from shared cache."
+            else
+                core.log.debug("L2 shared DICT cache hit but expired")
+                shm:delete(token)
+            end
+        end
+        core.log.debug("L2 shared DICT cache miss")
+    
+        local httpc = http.new()
+        local res, err = httpc:request_uri(keystone_url .. "/v3/auth/tokens", {
+            method = "GET",
+            headers = {
+                ["X-Auth-Token"] = token,
+                ["X-Subject-Token"] = token,
+                ["Content-Type"] = "application/json"
+            },
+            ssl_verify = false
+        })
+    
+        if not res then
+            core.log.info("Failed to reach Keystone: ", err)
+            return false, "Keystone request failed"
+        end
+    
+        if res.status ~= 200 then
+            core.log.info("Invalid Keystone token: ", res.status)
+            return false, "Invalid token"
+        end
+    
+        -- Parse JSON response
+        local body, err = cjson.decode(res.body)
+        if not body then
+            core.log.info("Failed to parse Keystone response: ", err)
+            return false, "Get response body failed"
+        end
+    
+    
+    
+        -- -- Extract project ID from response
+        local is_project_id = body.token and body.token.project and body.token.project.id
+        local project_id = body.token.project.id
+        if not is_project_id then
+            core.log.info("Project ID not found in Keystone response")
+            return false, "Get Project id failed"
+        end
+    
+        core.log.info("Extract project id from res body to :", project_id)
+    
+    
+        if not body or not body.token or not body.token.roles then
+            return false, "Missing role data"
+        end
+    
+        -- Convert allowed_roles list to a set for fast lookup
+        local allowed_roles_set = {}
+        for _, role in ipairs(allowed_roles) do
+            allowed_roles_set[role] = true
+            core.log.info("allowed_roles_set[" .. role .. "]: " .. tostring(allowed_roles_set[role]))
+        end
+    
+        local admin_roles_set = {}
+        for _, role in ipairs(admin_roles) do
+            admin_roles_set[role] = true
+        end
+    
+        -- Extract roles from response and check against allowed roles
+        local roles = body.token.roles
+    
+        for _, role_obj in ipairs(roles) do
+            local role_name = role_obj.name
+            core.log.info("Mapping role_name(admin_roles): " .. role_name .. " is " .. tostring(admin_roles_set[role_name]))
+            if admin_roles_set[role_name] then
+                local expires_at = body.token.expires_at
+                core.log.debug("body.token.expires_at: " .. expires_at)
+                local expiry_timestamp = parse_iso8601_time(expires_at)
+                core.log.debug("expiry_timestamp: " .. expiry_timestamp)
+                local cache_ttl = token_cache_ttl
+    
+                local cache_data = {
+                    project_id = project_id,
+                    is_grafana_admin = true,
+                    expiry = expiry_timestamp,
+                }
+    
+                core.log.info("User has admin role: ", role_name, " - Setting X-GRAFANAAUTH-USER to 'admin'.")
+                local encoded_cache_data = cjson.encode(cache_data)
+                cache:set(token, encoded_cache_data, cache_ttl)
+                shm:set(token, encoded_cache_data, cache_ttl)
+                return true, "admin" -- Admin user
+            end
+        end
+    
+        for _, role_obj in ipairs(roles) do
+            local role_name = role_obj.name
+            core.log.info("Mapping role_name(allowed_roles): " .. role_name .. " is " ..
+                tostring(allowed_roles_set[role_name]))
+            if allowed_roles_set[role_name] then
+                local expires_at = body.token.expires_at
+                core.log.debug("body.token.expires_at: " .. expires_at)
+                local expiry_timestamp = parse_iso8601_time(expires_at)
+                core.log.debug("expiry_timestamp: " .. expiry_timestamp)
+                local cache_ttl = token_cache_ttl
+    
+                local cache_data = {
+                    project_id = project_id,
+                    is_grafana_admin = false,
+                    expiry = expiry_timestamp,
+                }
+    
+                core.log.info("User has allowed role: ", role_name, " - Setting X-GRAFANAAUTH-USER to ", project_id, ".")
+                local encoded_cache_data = cjson.encode(cache_data)
+                cache:set(token, encoded_cache_data, cache_ttl)
+                shm:set(token, encoded_cache_data, cache_ttl)
+                return true, project_id -- User has a required role, return project ID
+            end
+        end
+    
+        -- return res.status == 200
+        return false, "User does not have the required role"
+    end
+    
+    function _M.access(conf, ctx)
+        local redirect_url = conf.redirect_url
+        local grafana_login_uri = conf.grafana_login_uri
+    
+        -- Extract cookie from the request
+        local cookie = ctx.var.http_cookie
+        if not cookie then
+            core.log.info("Unauthorized: No access token provided.")
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: No access token provided.")
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+        end
+    
+        -- Extract token from cookie (assuming it's stored as `token=value`)
+        local token = string.match(cookie, "token=([^;]+)")
+        if not token then
+            core.log.info("Unauthorized: Token not found.")
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: Token not found.")
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+        end
+    
+    
+        -- Remove existing X-GRAFANAAUTH-USER header from the original request (security)
+        -- core.request.set_header(ctx, "X-GRAFANAAUTH-USER", nil)
+    
+        -- Validate token and check roles
+        local valid, result = validate_token(conf.keystone_url, token, conf.allowed_roles, conf.admin_role,
+            conf.token_cache_ttl)
+    
+        if not valid then
+            core.log.info("Unauthorized: ", result)
+            ngx.status = ngx.HTTP_UNAUTHORIZED
+            ngx.say("Unauthorized: ", result)
+            return ngx.exit(ngx.HTTP_UNAUTHORIZED)
+        end
+    
+        -- Add Header
+        core.request.set_header(ctx, "X-GRAFANAAUTH-USER", result)
+    
+        -- Allow request to proceed
+        core.log.info("User authenticated successfully as project id :", result)
+    end
+    
+    return _M

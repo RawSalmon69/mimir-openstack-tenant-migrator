@@ -1,0 +1,67 @@
+[
+  {
+    "id": "grafana-health",
+    "uri": "/grafana/api/health",
+    "priority": 10,
+    "upstream": {
+      "type": "roundrobin",
+      "nodes": {
+        "grafana.monitoring.svc.cluster.local:80": 1
+      }
+    }
+  },
+  {
+    "id": "grafana-proxy",
+    "uri": "/grafana/*",
+    "upstream": {
+      "type": "roundrobin",
+      "nodes": {
+        "grafana.monitoring.svc.cluster.local:80": 1
+      }
+    },
+    "plugins": {
+      "grafana-keystone-authz": {
+        "keystone_url": "${KEYSTONE_URL}",
+        "allowed_roles": ["member", "_member_", "reader", "admin", "resource_admin", "resource_reader"],
+        "admin_role": ["nipa_grafana_admin"],
+        "redirect_url": "${CLUSTER_GATEWAY_URL}/grafana",
+        "token_cache_ttl": 60
+      }
+    }
+  },
+  {
+    "id": "mimir-proxy",
+    "uri": "/prometheus/*",
+    "upstream": {
+      "type": "roundrobin",
+      "nodes": {
+        "mimir-nginx.monitoring.svc.cluster.local:80": 1
+      }
+    },
+    "plugins": {
+      "mimir-keystone-authz": {
+        "keystone_url": "${KEYSTONE_URL}",
+        "allowed_roles": ["member", "_member_", "reader", "admin", "resource_admin", "resource_reader"],
+        "token_cache_ttl": 60
+      }
+    }
+  },
+  {
+    "id": "set-token",
+    "uri": "/set-token",
+    "upstream": {
+      "type": "roundrobin",
+      "nodes": {
+        "127.0.0.1:9180": 1
+      }
+    },
+    "plugins": {
+      "serverless-pre-function": {
+        "phase": "access",
+        "functions": [
+          "return function(conf, ctx) local token = ngx.var.arg_token; if not token then ngx.status = 400; ngx.say('missing token param'); return ngx.exit(400) end; ngx.header['Set-Cookie'] = 'token=' .. token .. '; Path=/; HttpOnly'; ngx.header['Location'] = '/grafana/dashboards'; ngx.status = 302; return ngx.exit(302) end"
+        ]
+      }
+    }
+  }
+]

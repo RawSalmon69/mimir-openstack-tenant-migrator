@@ -1,0 +1,519 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS-PROD",
+      "label": "Prometheus-Prod",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__elements": {},
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "12.0.2"
+    },
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "datasource",
+          "uid": "grafana"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${data_source}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 600000,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "id": 15,
+      "options": {
+        "legend": {
+          "calcs": [
+            "min",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "radosgw_usage_bucket_bytes{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\",owner=\"$project_id\"}",
+          "legendFormat": "{{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Storage Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${data_source}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 600000,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "id": 16,
+      "options": {
+        "legend": {
+          "calcs": [
+            "min",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "sum by(bucket,cluster)(radosgw_usage_received_bytes_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\",owner=\"$project_id\"})",
+          "legendFormat": "Ingress {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${data_source}"
+          },
+          "editorMode": "code",
+          "expr": "sum by(bucket,cluster)(radosgw_usage_sent_bytes_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\",owner=\"$project_id\"})",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "Egress {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "title": "Data Transfer",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS-PROD}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": 600000,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 11,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
+      "id": 17,
+      "options": {
+        "legend": {
+          "calcs": [
+            "min",
+            "max",
+            "last"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${data_source}"
+          },
+          "editorMode": "code",
+          "expr": "sum by(bucket,cluster)(radosgw_usage_ops_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\", category=~\"put.*\",owner=\"$project_id\"})",
+          "hide": true,
+          "legendFormat": "PUT {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "sum by(bucket,cluster)(radosgw_usage_ops_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\", category=~\"list.*\",owner=\"$project_id\"})",
+          "hide": true,
+          "instant": false,
+          "legendFormat": "GET {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "sum by(bucket,cluster)(radosgw_usage_ops_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\", category=~\"delete.*\",owner=\"$project_id\"})",
+          "hide": true,
+          "instant": false,
+          "legendFormat": "DELETE {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (bucket, cluster) (radosgw_usage_ops_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\",category=~\"bulk_upload|complete_multipart|config_bucket_meta_search|copy_obj|create_bucket|init_multipart|list_bucket|list_bucket_multiparts|list_buckets|list_multipart|multi_object_delete|post_obj|put_account_metadata|put_acls|put_bucket_encryption|put_bucket_logging|put_bucket_metadata|put_bucket_object_lock|put_bucket_policy|put_bucket_replication|put_bucket_tags|put_cors|put_lifecycle|put_obj|put_obj_legal_hold|put_obj_metadata|put_obj_retention|put_obj_tags|set_attrs|set_bucket_versioning|set_bucket_website|set_request_payment|stat_account|stat_bucket\",owner=\"$project_id\"})",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "PUT, COPY, POST, LIST {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS-PROD}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (bucket, cluster) (radosgw_usage_ops_total{bucket=~\"$bucket_name\", cluster=~\"$availability_zone\",category!~\"bulk_upload|complete_multipart|config_bucket_meta_search|copy_obj|create_bucket|init_multipart|list_bucket|list_bucket_multiparts|list_buckets|list_multipart|multi_object_delete|post_obj|put_account_metadata|put_acls|put_bucket_encryption|put_bucket_logging|put_bucket_metadata|put_bucket_object_lock|put_bucket_policy|put_bucket_replication|put_bucket_tags|put_cors|put_lifecycle|put_obj|put_obj_legal_hold|put_obj_metadata|put_obj_retention|put_obj_tags|set_attrs|set_bucket_versioning|set_bucket_website|set_request_payment|stat_account|stat_bucket\",owner=\"$project_id\"})",
+          "hide": false,
+          "instant": false,
+          "legendFormat": "GET, SELECT, Other {{bucket}} {{cluster}}",
+          "range": true,
+          "refId": "E"
+        }
+      ],
+      "title": "Request",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "",
+  "schemaVersion": 41,
+  "tags": [],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${data_source}"
+        },
+        "definition": "label_values(radosgw_usage_bucket_bytes{owner=\"${__user.login}\"},bucket)",
+        "includeAll": true,
+        "label": "bucket name",
+        "multi": true,
+        "name": "bucket_name",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(radosgw_usage_bucket_bytes{owner=\"${__user.login}\"},bucket)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allowCustomValue": false,
+        "current": {
+          "text": "ecad491dbe6648438e2e0fc9d07d9d11",
+          "value": "ecad491dbe6648438e2e0fc9d07d9d11"
+        },
+        "description": "",
+        "hide": 2,
+        "label": "ProjectID",
+        "name": "project_id",
+        "options": [
+          {
+            "selected": true,
+            "text": "ecad491dbe6648438e2e0fc9d07d9d11",
+            "value": "ecad491dbe6648438e2e0fc9d07d9d11"
+          }
+        ],
+        "query": "${__user.login}",
+        "type": "custom"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS-PROD}"
+        },
+        "definition": "label_values(radosgw_usage_bucket_bytes{owner=\"${__user.login}\"},cluster)",
+        "includeAll": true,
+        "label": "availability zone",
+        "name": "availability_zone",
+        "options": [],
+        "query": {
+          "qryType": 1,
+          "query": "label_values(radosgw_usage_bucket_bytes{owner=\"${__user.login}\"},cluster)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 1,
+        "regex": "",
+        "type": "query"
+      },
+      {
+        "allowCustomValue": false,
+        "current": {},
+        "hide": 2,
+        "name": "data_source",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "Prometheus-Prod",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": []
+  },
+  "timezone": "",
+  "title": "Objects Storage",
+  "uid": "cec0uuh9aof0gf",
+  "version": 13,
+  "weekStart": ""
+}

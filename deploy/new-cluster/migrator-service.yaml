@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: migrator
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: migrator
+    app.kubernetes.io/component: migration
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: migrator
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+      protocol: TCP

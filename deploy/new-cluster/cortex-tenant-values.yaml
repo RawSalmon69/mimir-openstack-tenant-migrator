@@ -1,0 +1,9 @@
+# cortex-tenant Helm values for new cluster — identical to STG
+# Source: helm get values cortex-tenant -n monitoring (STG cluster)
+
+config:
+  listen: 0.0.0.0:8080
+  target: http://mimir-nginx.monitoring.svc.cluster.local/api/v1/push
+  tenant:
+    default: default
+    label: projectId

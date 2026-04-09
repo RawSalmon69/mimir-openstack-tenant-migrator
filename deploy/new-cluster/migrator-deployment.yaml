@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: migrator
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: migrator
+    app.kubernetes.io/component: migration
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: migrator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrator
+        app.kubernetes.io/component: migration
+    spec:
+      serviceAccountName: migrator
+      nodeSelector:
+        kubernetes.io/hostname: kp-k8s-worker-1
+      containers:
+        - name: migrator
+          image: docker.io/nipa-mimir/migrator:latest
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: REDIS_ADDR
+              value: "redis-master.monitoring.svc.cluster.local:6379"
+            - name: CORTEX_URL
+              value: "http://cortex-tenant.monitoring.svc.cluster.local:8080/push"
+            - name: TSDB_PATH
+              value: "/data/tsdb"
+            - name: HTTP_ADDR
+              value: ":8090"
+            - name: MAX_BATCH_BYTES
+              value: "3145728"
+            - name: WRITER_CONCURRENCY
+              value: "4"
+            # QUEUE_CONCURRENCY must stay at 1: the TSDB reader calls
+            # promtsdb.Open which acquires an exclusive lock file in the
+            # TSDB directory, so two simultaneous migrations of different
+            # tenants against the same source TSDB cause one of them to
+            # fail with "resource temporarily unavailable". Serialising
+            # at the asynq layer is the simplest way to avoid the race.
+            - name: QUEUE_CONCURRENCY
+              value: "1"
+            - name: DRY_RUN
+              value: "false"
+            - name: HISTORY_LOG_PATH
+              value: "/var/log/migrator/history.jsonl"
+          volumeMounts:
+            # tsdb-data must be mounted read-write because promtsdb.Open
+            # acquires a lock file inside the TSDB directory on open. The
+            # migrator only reads block data — no samples are written back.
+            - name: tsdb-data
+              mountPath: /data/tsdb
+            - name: history-log
+              mountPath: /var/log/migrator
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "6"
+              memory: "28Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+      volumes:
+        - name: tsdb-data
+          hostPath:
+            path: /mnt/data_dump/data
+            type: Directory
+        - name: history-log
+          emptyDir: {}
+      restartPolicy: Always

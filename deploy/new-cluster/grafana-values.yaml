@@ -1,0 +1,69 @@
+# Grafana Helm values for new cluster
+# Source: helm get values grafana -n monitoring (STG cluster)
+# root_url uses ${CLUSTER_GATEWAY_URL} placeholder for PROD node IP.
+
+image:
+  tag: 12.0.2
+
+adminPassword: admin123
+
+initChownData:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+persistence:
+  enabled: true
+  size: 1Gi
+
+service:
+  type: NodePort
+  nodePort: 31546
+
+grafana.ini:
+  analytics:
+    check_for_updates: true
+
+  server:
+    root_url: "${CLUSTER_GATEWAY_URL}/grafana"
+    serve_from_sub_path: true
+
+  auth:
+    disable_login_form: true
+
+  auth.proxy:
+    enabled: true
+    header_name: X-GRAFANAAUTH-USER
+    header_property: username
+    auto_sign_up: true
+    auto_sign_up_role: Viewer
+
+  auth.anonymous:
+    enabled: true
+    org_role: Viewer
+
+  dataproxy:
+    send_user_header: true
+
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Mimir
+        type: prometheus
+        uid: mimir-tenant
+        url: http://apisix-gateway.monitoring.svc.cluster.local:80/prometheus
+        access: proxy
+        isDefault: true
+        jsonData:
+          timeInterval: 30s
+          httpMethod: GET
+          keepCookies:
+            - token
+        editable: true

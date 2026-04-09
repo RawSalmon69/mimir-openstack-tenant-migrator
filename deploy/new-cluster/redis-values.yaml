@@ -1,0 +1,19 @@
+# Redis Bitnami standalone values for new cluster
+# Not present in STG — new addition for PROD APISIX rate limiting / session storage.
+
+architecture: standalone
+
+auth:
+  enabled: false
+
+master:
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    limits:
+      cpu: 200m
+      memory: 256Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi

@@ -1,0 +1,137 @@
+# APISIX Helm values for new cluster — identical to STG
+# Source: helm get values apisix -n monitoring (STG cluster)
+
+service:
+  type: NodePort
+  http:
+    nodePort: 31545
+
+ingress-controller:
+  enabled: false
+
+apisix:
+  plugins:
+    - real-ip
+    - ai
+    - client-control
+    - proxy-control
+    - request-id
+    - zipkin
+    - ext-plugin-pre-req
+    - fault-injection
+    - mocking
+    - serverless-pre-function
+    - cors
+    - ip-restriction
+    - ua-restriction
+    - referer-restriction
+    - csrf
+    - uri-blocker
+    - request-validation
+    - chaitin-waf
+    - multi-auth
+    - openid-connect
+    - cas-auth
+    - authz-casbin
+    - authz-casdoor
+    - wolf-rbac
+    - ldap-auth
+    - hmac-auth
+    - basic-auth
+    - jwt-auth
+    - jwe-decrypt
+    - key-auth
+    - consumer-restriction
+    - attach-consumer-label
+    - forward-auth
+    - opa
+    - authz-keycloak
+    - proxy-cache
+    - body-transformer
+    - ai-prompt-template
+    - ai-prompt-decorator
+    - ai-prompt-guard
+    - ai-rag
+    - ai-rate-limiting
+    - ai-proxy-multi
+    - ai-proxy
+    - ai-aws-content-moderation
+    - ai-aliyun-content-moderation
+    - proxy-mirror
+    - proxy-rewrite
+    - workflow
+    - api-breaker
+    - limit-conn
+    - limit-count
+    - limit-req
+    - gzip
+    - traffic-split
+    - redirect
+    - response-rewrite
+    - mcp-bridge
+    - degraphql
+    - kafka-proxy
+    - grpc-transcode
+    - grpc-web
+    - http-dubbo
+    - public-api
+    - prometheus
+    - datadog
+    - lago
+    - loki-logger
+    - elasticsearch-logger
+    - echo
+    - loggly
+    - http-logger
+    - splunk-hec-logging
+    - skywalking-logger
+    - google-cloud-logging
+    - sls-logger
+    - tcp-logger
+    - kafka-logger
+    - rocketmq-logger
+    - syslog
+    - udp-logger
+    - file-logger
+    - clickhouse-logger
+    - tencent-cloud-cls
+    - inspect
+    - example-plugin
+    - aws-lambda
+    - azure-functions
+    - openwhisk
+    - openfunction
+    - serverless-post-function
+    - ext-plugin-post-req
+    - ext-plugin-post-resp
+    - ai-request-rewrite
+    - mimir-keystone-authz
+    - grafana-keystone-authz
+
+  customPlugins:
+    enabled: true
+    luaPath: "/usr/local/apisix/custom-plugins/?.lua"
+    plugins:
+      - name: "mimir-keystone-authz"
+        attrs: {}
+        configMap:
+          name: "mimir-keystone-authz-plugin"
+          mounts:
+            - key: "mimir-keystone-authz.lua"
+              path: "/usr/local/apisix/custom-plugins/apisix/plugins/mimir-keystone-authz.lua"
+      - name: "grafana-keystone-authz"
+        attrs: {}
+        configMap:
+          name: "grafana-keystone-authz-plugin"
+          mounts:
+            - key: "grafana-keystone-authz.lua"
+              path: "/usr/local/apisix/custom-plugins/apisix/plugins/grafana-keystone-authz.lua"
+
+  nginx:
+    workerRlimitNofile: 20480
+    workerProcesses: auto
+    customLuaSharedDicts:
+      - name: mimir_keystone_token_cache
+        size: 5m
+      - name: grafana_keystone_token_cache
+        size: 5m

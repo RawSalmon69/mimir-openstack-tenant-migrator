@@ -1,0 +1,48 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Language / build artifacts
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/
+
+# Credentials — never commit
+*.pem
+*.key
+*_RC_file*.sh
+*_rc_file*.sh
+
+# GSD and local tooling state (project-specific planning, not code)
+.gsd
+.gsd-id
+.gsd-local/
+.planning/
+.bg-shell/
+gsd-session-*.html
+
+# Go build artifacts from local runs
+services/migrator/revert-overrides
+services/migrator/migrator
