@@ -1,7 +1,4 @@
-# Mimir Helm values for new cluster deployment
-# Replicated from STG (helm get values mimir -n monitoring)
-# S3 credentials replaced with env-var placeholders for PROD.
-
+# Mimir Helm values — S3 placeholders substituted by deploy.sh
 mimir:
   structuredConfig:
     multitenancy_enabled: true
@@ -21,6 +18,11 @@ mimir:
     blocks_storage:
       s3:
         bucket_name: "${MIMIR_S3_BUCKET_BLOCKS}"
+      bucket_store:
+        sync_interval: 1m  # default 15m — too slow for bulk migration visibility
+
+    compactor:
+      cleanup_interval: 1m  # default 15m — matches bucket_store sync
 
     ruler_storage:
       s3:
@@ -33,14 +35,10 @@ mimir:
 minio:
   enabled: false
 
-# Kafka broker configuration. The mimir-distributed chart runs kafka as the
-# ingest-storage backend in Mimir 3.x. Default message.max.bytes is 1 MiB
-# which is too small for bulk-migration writes from the migrator — raising
-# to 100 MiB gives plenty of headroom for multi-MiB batches. The matching
-# replica.fetch.max.bytes and socket.request.max.bytes are required to keep
-# the broker consistent.
+# Raise Kafka message size to 100 MiB (default 1 MiB is too small for bulk writes).
+# Key is kafka.extraEnv, NOT kafka.extraEnvVars (bitnami convention — silently ignored).
 kafka:
-  extraEnvVars:
+  extraEnv:
     - name: KAFKA_MESSAGE_MAX_BYTES
       value: "104857600"
     - name: KAFKA_REPLICA_FETCH_MAX_BYTES

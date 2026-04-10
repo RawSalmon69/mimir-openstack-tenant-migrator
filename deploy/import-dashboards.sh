@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-#
-# import-dashboards.sh — Import all 7 Grafana dashboards via port-forward.
-# K010: Uses kubectl port-forward to reach Grafana admin API.
-# K012: Dashboard import with inputs[] remapping DS_PROMETHEUS-PROD to mimir-tenant.
-#
-# Required environment variables:
-#   GRAFANA_ADMIN_PASSWORD   — Grafana admin password
-#
-# Optional:
-#   NAMESPACE                — Kubernetes namespace (default: monitoring)
-#   GRAFANA_DS_UID           — Datasource UID in Grafana (default: mimir-tenant)
-#   LOCAL_PORT               — Local port for port-forward (default: 3000)
+# import-dashboards.sh — Import Grafana dashboards via port-forward.
+# Required: GRAFANA_ADMIN_PASSWORD
 
 set -euo pipefail
 
@@ -18,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAMESPACE="${NAMESPACE:-monitoring}"
 GRAFANA_DS_UID="${GRAFANA_DS_UID:-mimir-tenant}"
 LOCAL_PORT="${LOCAL_PORT:-3000}"
-DASHBOARD_DIR="$SCRIPT_DIR/../../grafana-monitor-system-main-grafana-dashboards-general/grafana/dashboards/general"
+DASHBOARD_DIR="$SCRIPT_DIR/../grafana-monitor-system-main-grafana-dashboards-general/grafana/dashboards/general"
 
 if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
   echo "ERROR: GRAFANA_ADMIN_PASSWORD is required" >&2
@@ -58,7 +48,7 @@ if [[ "$DS_EXISTS" != "200" ]]; then
       \"name\": \"Prometheus-Prod\",
       \"type\": \"prometheus\",
       \"uid\": \"${GRAFANA_DS_UID}\",
-      \"url\": \"http://mimir-nginx.${NAMESPACE}.svc.cluster.local:80/prometheus\",
+      \"url\": \"http://mimir-gateway.${NAMESPACE}.svc.cluster.local:80/prometheus\",
       \"access\": \"proxy\",
       \"isDefault\": true
     }" || echo "  WARNING: datasource creation failed (may already exist with different uid)"
@@ -88,7 +78,7 @@ for db_file in "${DASHBOARDS[@]}"; do
 
   echo "  Importing $db_file ..."
 
-  # Build the import payload with inputs[] remapping (K012)
+  # Build the import payload with inputs[] remapping
   # Dynamically map ALL __inputs datasource entries to our single Mimir datasource
   # Write to temp file to avoid "Argument list too long" with large dashboards (K-new)
   PAYLOAD_FILE=$(mktemp /tmp/dashboard_import_XXXXXX.json)

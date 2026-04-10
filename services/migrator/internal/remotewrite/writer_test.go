@@ -25,7 +25,7 @@ func makeSeries(n, samplesPerSeries int) []prompb.TimeSeries {
 			{Name: "projectId", Value: "tenant-abc"},
 			{Name: "job", Value: "test"},
 		}
-		// Sort labels by name (K003).
+		// Sort labels by name.
 		sort.Slice(labels, func(a, b int) bool {
 			return labels[a].Name < labels[b].Name
 		})
@@ -71,7 +71,7 @@ func TestBuildWriteRequestRoundTrip(t *testing.T) {
 			t.Errorf("series %d: expected 5 samples, got %d", i, len(ts.Samples))
 		}
 
-		// Verify labels are sorted by name (K003).
+		// Verify labels are sorted by name.
 		for j := 1; j < len(ts.Labels); j++ {
 			if ts.Labels[j-1].Name >= ts.Labels[j].Name {
 				t.Errorf("series %d: labels not sorted: %s >= %s", i, ts.Labels[j-1].Name, ts.Labels[j].Name)

@@ -20,9 +20,13 @@ spec:
       serviceAccountName: migrator
       nodeSelector:
         kubernetes.io/hostname: kp-k8s-worker-1
+      securityContext:
+        runAsUser: 65534   # match TSDB hostPath owner (nobody)
+        runAsGroup: 65534
+        fsGroup: 65534
       containers:
         - name: migrator
-          image: docker.io/nipa-mimir/migrator:latest
+          image: docker.io/mimir-openstack-tenant-migrator/migrator:latest
           imagePullPolicy: Never
           ports:
             - name: http
@@ -41,22 +45,13 @@ spec:
               value: "3145728"
             - name: WRITER_CONCURRENCY
               value: "4"
-            # QUEUE_CONCURRENCY must stay at 1: the TSDB reader calls
-            # promtsdb.Open which acquires an exclusive lock file in the
-            # TSDB directory, so two simultaneous migrations of different
-            # tenants against the same source TSDB cause one of them to
-            # fail with "resource temporarily unavailable". Serialising
-            # at the asynq layer is the simplest way to avoid the race.
             - name: QUEUE_CONCURRENCY
-              value: "1"
+              value: "1"  # must be 1 — TSDB lock file prevents concurrent opens
             - name: DRY_RUN
               value: "false"
             - name: HISTORY_LOG_PATH
               value: "/var/log/migrator/history.jsonl"
           volumeMounts:
-            # tsdb-data must be mounted read-write because promtsdb.Open
-            # acquires a lock file inside the TSDB directory on open. The
-            # migrator only reads block data — no samples are written back.
             - name: tsdb-data
               mountPath: /data/tsdb
             - name: history-log

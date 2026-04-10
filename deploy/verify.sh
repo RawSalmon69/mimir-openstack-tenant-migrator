@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-#
-# verify.sh — Health check verification for the monitoring stack.
-# Checks pod status, APISIX routes, Grafana health, Redis, cortex-tenant,
-# dashboard count, and unauthenticated access returns 401.
-#
-# Optional:
-#   NAMESPACE                — Kubernetes namespace (default: monitoring)
-#   APISIX_ADMIN_KEY         — APISIX admin API key
-#   GRAFANA_ADMIN_PASSWORD   — Grafana admin password (needed for dashboard count check)
+# verify.sh — Post-deploy health checks for the monitoring stack.
 
 set -euo pipefail
 
@@ -51,9 +43,8 @@ check_output() {
 echo "=== Monitoring Stack Health Checks ==="
 echo ""
 
-# ── 1. Pod Status ───────────────────────────────────────────────────────────
 echo "--- Pod Status ---"
-NON_RUNNING=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | grep -v Running | grep -v Completed | wc -l | tr -d ' ')
+NON_RUNNING=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | awk '!/Running/ && !/Completed/ {n++} END {print n+0}')
 TOTAL=$((TOTAL + 1))
 echo -n "  [$TOTAL] All pods Running (non-running: $NON_RUNNING) ... "
 if [[ "$NON_RUNNING" -le 1 ]]; then
@@ -64,19 +55,16 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# Individual component pods
 for component in mimir apisix grafana redis cortex-tenant; do
   check "Pod exists: $component" \
     kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=$component" -o name
 done
 
-# ── 2. APISIX Routes via Admin API ─────────────────────────────────────────
 echo ""
 echo "--- APISIX Routes ---"
 APISIX_POD=$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=apisix -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 
 if [[ -n "$APISIX_POD" ]]; then
-  # K005: Use bash /dev/tcp since APISIX pod has no curl
   check_output "APISIX route count >= 4" '"total":4' \
     kubectl -n "$NAMESPACE" exec -c apisix "$APISIX_POD" -- bash -c "
       exec 3<>/dev/tcp/127.0.0.1/9180
@@ -85,7 +73,6 @@ if [[ -n "$APISIX_POD" ]]; then
       exec 3>&-
     " 2>/dev/null
 
-  # Check specific routes exist
   for route_id in grafana-health grafana-proxy mimir-proxy set-token; do
     check_output "Route exists: $route_id" "\"id\":\"$route_id\"" \
       kubectl -n "$NAMESPACE" exec -c apisix "$APISIX_POD" -- bash -c "
@@ -101,10 +88,8 @@ else
   TOTAL=$((TOTAL + 5))
 fi
 
-# ── 3. Grafana Health ──────────────────────────────────────────────────────
 echo ""
 echo "--- Grafana ---"
-# Port-forward briefly to check health (K010)
 kubectl -n "$NAMESPACE" port-forward svc/grafana 13000:80 &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true' EXIT
@@ -113,13 +98,11 @@ sleep 3
 check_output "Grafana /api/health returns ok" '"database": "ok"' \
   curl -sf http://localhost:13000/api/health
 
-# Dashboard count check
 if [[ -n "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
   check_output "Grafana has >= 7 dashboards" '"id"' \
     curl -sf "http://admin:${GRAFANA_ADMIN_PASSWORD}@localhost:13000/api/search?type=dash-db"
 fi
 
-# ── 4. Redis PING ──────────────────────────────────────────────────────────
 echo ""
 echo "--- Redis ---"
 REDIS_POD=$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=redis -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -132,7 +115,6 @@ else
   TOTAL=$((TOTAL + 1))
 fi
 
-# ── 5. cortex-tenant logs ─────────────────────────────────────────────────
 echo ""
 echo "--- cortex-tenant ---"
 CT_POD=$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/name=cortex-tenant -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
@@ -141,7 +123,6 @@ if [[ -n "$CT_POD" ]]; then
     kubectl -n "$NAMESPACE" get pod "$CT_POD" -o jsonpath='{.status.phase}'
 fi
 
-# ── 6. Unauthenticated access returns 401 ─────────────────────────────────
 echo ""
 echo "--- Auth Enforcement ---"
 if [[ -n "${CLUSTER_GATEWAY_URL:-}" ]]; then
@@ -159,7 +140,6 @@ else
   echo "  ⚠️  CLUSTER_GATEWAY_URL not set, skipping auth check"
 fi
 
-# ── Summary ────────────────────────────────────────────────────────────────
 kill $PF_PID 2>/dev/null || true
 echo ""
 echo "=== Results: ${PASS}/${TOTAL} passed, ${FAIL} failed ==="

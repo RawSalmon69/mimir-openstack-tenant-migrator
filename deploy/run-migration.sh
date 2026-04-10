@@ -1,46 +1,10 @@
 #!/usr/bin/env bash
-#
-# run-migration.sh — end-to-end migration helper for the Mimir tenant importer.
-#
-# Wraps the three-step dance required to migrate a tenant's historical TSDB
-# data into Mimir:
-#
-#   1. Patch the mimir-runtime ConfigMap with per-tenant overrides so the
-#      migration writes are not rejected by Mimir's default ingestion rate
-#      and burst limits (10k/s, 200k burst) — both are far below what a
-#      bulk migration needs.
-#   2. Wait for Mimir's runtime_config poller to pick up the new file.
-#   3. Port-forward the migrator Deployment and POST /migrate with the
-#      requested tenant IDs.
-#
-# Subcommands:
-#
-#   run [-f FILE] [-w] <tenant-id>...    — apply overrides and start a migration.
-#                                          Pass tenants as positional args and/or
-#                                          via -f FILE (one tenant id per line,
-#                                          # comments + blank lines ignored).
-#                                          -w / --wait blocks until every
-#                                          enqueued task reaches terminal state.
-#   status                               — print /status for all tracked tasks
-#   status <task-id>                     — print /status/<task-id>
-#   wait <task-id>                       — poll /status/<task-id> until terminal
-#   wait --all                           — block until every tracked task is
-#                                          terminal (active+pending == 0)
-#   delete <tenant-id>                   — cancel + clear progress for one tenant
-#   delete --all                         — cancel + clear every tracked task
-#
-# Environment overrides:
-#
-#   NAMESPACE                  Kubernetes namespace         (default: monitoring)
-#   RUNTIME_CM                 Mimir runtime ConfigMap name (default: mimir-runtime)
-#   OOO_WINDOW                 per-tenant OOO window        (default: 2880h)
-#   INGESTION_RATE             per-tenant samples/sec limit (default: 1000000)
-#   INGESTION_BURST_SIZE       per-tenant burst cap         (default: 2000000)
-#   RUNTIME_RELOAD_WAIT_SECS   post-patch wait before POST  (default: 15)
-#   PORT_FORWARD_PORT          local port for migrator API  (default: 8090)
-#   MIGRATOR_DEPLOYMENT        deployment name              (default: migrator)
-#
-# Requirements: kubectl, curl, python3.
+# run-migration.sh — patch overrides, port-forward, POST /migrate.
+# Usage: ./run-migration.sh run [-f FILE] [--wait] <tenant-id>...
+#        ./run-migration.sh status [task-id]
+#        ./run-migration.sh wait <task-id|--all>
+#        ./run-migration.sh delete <tenant-id|--all>
+# Requires: kubectl, curl, python3.
 
 set -euo pipefail
 
@@ -77,8 +41,7 @@ require() {
 }
 
 start_port_forward() {
-  # Start a background port-forward to the migrator deployment and wait for
-  # its /healthz to respond. Aborts if the forward does not become ready.
+  # Port-forward to migrator and wait for /healthz.
   kubectl -n "$NAMESPACE" port-forward "deploy/$MIGRATOR_DEPLOYMENT" \
     "$PORT_FORWARD_PORT:8090" >/dev/null 2>&1 &
   PF_PID=$!
@@ -97,14 +60,8 @@ start_port_forward() {
 }
 
 patch_runtime_config() {
-  # Overwrite the runtime.yaml entry of the mimir-runtime ConfigMap with a
-  # freshly-built overrides block for the requested tenants.
-  #
-  # This REPLACES any previously-written overrides (for any other tenants)
-  # in the same ConfigMap. For the single-shot migration workflow this is
-  # the intended behaviour — pass every tenant you want to migrate in one
-  # invocation. A future merge-preserving variant could be added if pyyaml
-  # becomes a hard dependency.
+  # Patch mimir-runtime ConfigMap with per-tenant overrides.
+  # Replaces all existing overrides — pass every tenant in one invocation.
   local tenants=("$@")
 
   local runtime_yaml
@@ -151,8 +108,7 @@ print(json.dumps(body))
 }
 
 read_tenants_from_file() {
-  # Read one tenant id per line. Lines starting with # are comments; blank
-  # lines and inline trailing whitespace are ignored.
+  # Read tenant IDs from file (one per line, # comments allowed).
   local file="$1"
   if [ ! -r "$file" ]; then
     echo "ERROR: cannot read tenants file: $file" >&2
@@ -303,8 +259,7 @@ for t in d.get("tasks", []):
 }
 
 restart_port_forward() {
-  # Tear down any existing port-forward and start a fresh one. Used by
-  # the wait loop to recover after a pod restart kills the forward.
+  # Restart port-forward (recovers after pod restart).
   if [ -n "$PF_PID" ] && kill -0 "$PF_PID" 2>/dev/null; then
     kill "$PF_PID" 2>/dev/null || true
     wait "$PF_PID" 2>/dev/null || true
@@ -314,9 +269,7 @@ restart_port_forward() {
 }
 
 wait_all_loop() {
-  # Poll /status until no task is in 'active' or 'pending' state. Assumes
-  # the port-forward is already up (caller is either cmd_wait_all or the
-  # end of cmd_run -w).
+  # Poll /status until all tasks are terminal.
   local interval=10
   local max_polls=720
   local consecutive_failures=0
@@ -403,8 +356,6 @@ cmd_wait() {
     if [ -z "$resp" ]; then
       consecutive_failures=$((consecutive_failures + 1))
       echo "[$i] (status fetch failed — retry $consecutive_failures)"
-      # After three consecutive failures, the port-forward is probably dead
-      # (e.g. the migrator pod was OOMKilled and restarted). Rebuild it.
       if [ "$consecutive_failures" -ge 3 ]; then
         echo "[$i] (restarting port-forward — pod likely restarted)"
         restart_port_forward || true
@@ -464,8 +415,7 @@ cmd_delete() {
     url="http://localhost:$PORT_FORWARD_PORT/tasks?all=true"
     echo "→ DELETE /tasks?all=true"
   else
-    # URL-encode is unnecessary for a 32-char lowercase hex project_id, but
-    # guard against anything unexpected by failing loud on obvious garbage.
+    # Basic validation on tenant ID format.
     url="http://localhost:$PORT_FORWARD_PORT/tasks?project_id=$target"
     echo "→ DELETE /tasks?project_id=$target"
   fi

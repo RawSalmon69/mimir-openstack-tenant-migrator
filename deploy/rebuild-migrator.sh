@@ -1,40 +1,17 @@
 #!/usr/bin/env bash
+# rebuild-migrator.sh — build → save → scp → ctr import → rollout restart.
+# Requires: docker, kubectl, ssh (+ sshpass if using TARGET_NODE_PASS).
 #
-# rebuild-migrator.sh — build the migrator image from source, import it
-# into the target k3s node's containerd image store, and roll the live
-# deployment so the new binary takes over.
-#
-# Because the migrator uses `imagePullPolicy: Never` and is pinned to a
-# specific worker node via `nodeSelector`, the image must exist in
-# containerd's image cache on that node — it is not pulled from a
-# registry. This script wraps the build → save → transfer → import →
-# rollout sequence into one command.
-#
-# Prerequisites on the machine running this script:
-#   - docker (or docker-compatible) for building
-#   - kubectl configured for the target cluster
-#   - ssh + sshpass (or key-based auth) to the target node
-#
-# Environment overrides:
-#
-#   MIGRATOR_IMAGE      image tag to build       (default: docker.io/nipa-mimir/migrator:latest)
-#   NAMESPACE           kubernetes namespace     (default: monitoring)
-#   DEPLOYMENT          deployment name          (default: migrator)
-#   TARGET_NODE_HOST    ssh host of target node  (default: 183.90.173.185, i.e. worker-1)
-#   TARGET_NODE_USER    ssh user                 (default: nc-user)
-#   TARGET_NODE_PASS    ssh password             (default: empty — assumes key auth)
-#   CTR_NAMESPACE       containerd namespace     (default: k8s.io)
-#   SKIP_BUILD          set to 1 to skip `docker build`
-#   SKIP_IMPORT         set to 1 to skip save+scp+import (useful for dry-run)
-#   SKIP_ROLLOUT        set to 1 to skip `kubectl rollout restart`
-#   WAIT_TIMEOUT        seconds to wait for new pod Ready (default: 180)
+# Required: TARGET_NODE_HOST (worker node IP)
+# Optional: TARGET_NODE_USER (default: nc-user), TARGET_NODE_PASS,
+#           MIGRATOR_IMAGE, NAMESPACE, SKIP_BUILD, SKIP_IMPORT, SKIP_ROLLOUT
 
 set -euo pipefail
 
-MIGRATOR_IMAGE="${MIGRATOR_IMAGE:-docker.io/nipa-mimir/migrator:latest}"
+MIGRATOR_IMAGE="${MIGRATOR_IMAGE:-docker.io/mimir-openstack-tenant-migrator/migrator:latest}"
 NAMESPACE="${NAMESPACE:-monitoring}"
 DEPLOYMENT="${DEPLOYMENT:-migrator}"
-TARGET_NODE_HOST="${TARGET_NODE_HOST:-183.90.173.185}"
+TARGET_NODE_HOST="${TARGET_NODE_HOST:-}"
 TARGET_NODE_USER="${TARGET_NODE_USER:-nc-user}"
 TARGET_NODE_PASS="${TARGET_NODE_PASS:-}"
 CTR_NAMESPACE="${CTR_NAMESPACE:-k8s.io}"
@@ -43,8 +20,13 @@ SKIP_IMPORT="${SKIP_IMPORT:-}"
 SKIP_ROLLOUT="${SKIP_ROLLOUT:-}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
 
+if [[ -z "$TARGET_NODE_HOST" && -z "$SKIP_IMPORT" ]]; then
+  echo "ERROR: TARGET_NODE_HOST is required (the worker node IP where the migrator pod runs)" >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MIGRATOR_DIR="$REPO_ROOT/services/migrator"
 
 TMP_TAR=""

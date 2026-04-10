@@ -1,0 +1,6 @@
+config:
+  listen: 0.0.0.0:8080
+  target: http://mimir-gateway.monitoring.svc.cluster.local/api/v1/push
+  tenant:
+    default: default
+    label: projectId

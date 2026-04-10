@@ -14,16 +14,64 @@ preserving strict cross-tenant isolation on both the read and write paths.
 
 ## Table of contents
 
-1. [What this repo is](#what-this-repo-is)
-2. [Topology at a glance](#topology-at-a-glance)
-3. [Repo layout](#repo-layout)
-4. [Prerequisites](#prerequisites)
-5. [Deploying a fresh cluster](#deploying-a-fresh-cluster)
-6. [Running a migration](#running-a-migration)
-7. [Day-2 operations](#day-2-operations)
+1. [Quickstart](#quickstart)
+2. [What this repo is](#what-this-repo-is)
+3. [Topology at a glance](#topology-at-a-glance)
+4. [Repo layout](#repo-layout)
+5. [Prerequisites](#prerequisites)
+6. [Deploying a fresh cluster](#deploying-a-fresh-cluster)
+7. [Running a migration](#running-a-migration)
 8. [Local development](#local-development)
 9. [Known limitations](#known-limitations)
 10. [Troubleshooting](#troubleshooting)
+
+---
+
+## Quickstart
+
+All scripts run **on the k3s master node**, not your workstation.
+Clone the repo there, export credentials, and go:
+
+```bash
+# 1. SSH into master and clone
+ssh <user>@<master-ip>
+git clone https://github.com/RawSalmon69/mimir-openstack-tenant-migrator.git
+cd mimir-openstack-tenant-migrator
+
+# 2. Export credentials (or source your .env.prod)
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export MIMIR_S3_ENDPOINT=https://s3.your-provider.example
+export MIMIR_S3_ACCESS_KEY=...
+export MIMIR_S3_SECRET_KEY=...
+export MIMIR_S3_REGION=your-region
+export MIMIR_S3_BUCKET_BLOCKS=mimir-blocks
+export MIMIR_S3_BUCKET_RULER=mimir-ruler
+export MIMIR_S3_BUCKET_ALERTS=mimir-alerts
+export KEYSTONE_URL=https://keystone.your-openstack.example
+export CLUSTER_GATEWAY_URL=http://<master-ip>:31545
+export GRAFANA_ADMIN_PASSWORD='change-me'
+
+# 3. Deploy the full stack (idempotent, safe to re-run)
+cd deploy && sudo -E ./deploy.sh          # ends with verify.sh 16/16
+
+# 4. Build + ship the migrator image to the worker node
+#    TARGET_NODE_HOST = worker IP where the migrator pod runs (required)
+sudo -E TARGET_NODE_HOST=<worker-ip> TARGET_NODE_PASS='...' ./rebuild-migrator.sh
+
+# 5. Run a migration
+echo "your-tenant-id" > tenants.txt
+sudo -E ./run-migration.sh run --wait -f tenants.txt
+
+# 6. Verify data is queryable (~1-2 min after migration)
+kubectl run curl-test --rm -i --restart=Never -n monitoring \
+  --image=curlimages/curl:latest -q --command -- \
+  curl -sS "http://mimir-gateway.monitoring.svc.cluster.local/prometheus/api/v1/query?query=up" \
+  -H "X-Scope-OrgID: your-tenant-id"
+```
+
+For k3s clusters, `kubectl` and `helm` require `sudo` or
+`export KUBECONFIG=/etc/rancher/k3s/k3s.yaml`. All `deploy/` scripts
+are designed to run on the master node with direct cluster access.
 
 ---
 
@@ -32,9 +80,9 @@ preserving strict cross-tenant isolation on both the read and write paths.
 Two things, in one repo:
 
 1. **`services/migrator/`** — a Go service that streams a Prometheus TSDB directory tenant-by-tenant into Mimir via `cortex-tenant`, managing per-tenant OOO windows and ingestion rate limits on the fly via Kubernetes ConfigMap patches. Runs as an HTTP API + asynq worker in a single binary; also ships two CLI tools (`cmd/migrator`, `cmd/revert-overrides`).
-2. **`deploy/new-cluster/`** — the Kubernetes manifests, Helm values, and Lua APISIX plugins that stand up the whole monitoring stack. One `deploy.sh` bootstraps it end-to-end.
+2. **`deploy/`** — Kubernetes manifests, Helm values, Lua APISIX plugins, and operational scripts that deploy the whole monitoring stack. One `deploy.sh` bootstraps it end-to-end.
 
-The end state: users log in with Keystone, get a token scoped to their `project_id`, and every query into Grafana/Mimir is physically isolated per tenant — enforced at the TSDB block level, not just at the UI.
+The end state: users log in with Keystone, get a token scoped to their `project_id`, and every query into Grafana/Mimir is physically isolated per tenant — enforced at the TSDB block level.
 
 ---
 
@@ -142,25 +190,25 @@ NIPA-Mimir/
 │       ├── Dockerfile              multi-stage, distroless/static runtime
 │       ├── go.mod                  Go 1.25
 │       └── go.sum
-├── deploy/
-│   └── new-cluster/                Kubernetes manifests + Helm values
-│       ├── deploy.sh               one-shot deployment orchestrator
-│       ├── dry-run.sh              migration dry-run helper
-│       ├── verify.sh               post-deploy health checks
-│       ├── run-migration.sh        run/status/wait wrapper over the migrator API
-│       ├── import-dashboards.sh    Grafana dashboard bulk-import
-│       ├── mimir-values.yaml       Mimir Helm values (S3 placeholders)
-│       ├── cortex-tenant-values.yaml
-│       ├── redis-values.yaml       Bitnami Redis (standalone, no auth)
-│       ├── apisix-values.yaml      APISIX gateway values
-│       ├── apisix-routes.json      APISIX route definitions (templated)
-│       ├── configmap-mimir-keystone-authz.yaml    Lua plugin ConfigMap
-│       ├── configmap-grafana-keystone-authz.yaml  Lua plugin ConfigMap
-│       ├── grafana-values.yaml     Grafana Helm values
-│       ├── migrator-rbac.yaml      ServiceAccount + Role + RoleBinding
-│       ├── migrator-service.yaml   ClusterIP Service
-│       ├── migrator-tsdb-pvc.yaml  PVC template for TSDB hostPath
-│       └── migrator-deployment.yaml
+├── deploy/                             Kubernetes manifests + Helm values
+│   ├── deploy.sh                       one-shot deployment orchestrator
+│   ├── dry-run.sh                      migration dry-run helper
+│   ├── verify.sh                       post-deploy health checks
+│   ├── run-migration.sh                run/status/wait wrapper over the migrator API
+│   ├── rebuild-migrator.sh             build → save → scp → ctr-import → rollout
+│   ├── import-dashboards.sh            Grafana dashboard bulk-import
+│   ├── mimir-values.yaml               Mimir Helm values (S3 placeholders)
+│   ├── cortex-tenant-values.yaml
+│   ├── redis-values.yaml               Bitnami Redis (standalone, no auth)
+│   ├── apisix-values.yaml              APISIX gateway values
+│   ├── apisix-routes.json              APISIX route definitions (templated)
+│   ├── configmap-mimir-keystone-authz.yaml    Lua plugin ConfigMap
+│   ├── configmap-grafana-keystone-authz.yaml  Lua plugin ConfigMap
+│   ├── grafana-values.yaml             Grafana Helm values
+│   ├── migrator-rbac.yaml              ServiceAccount + Role + RoleBinding
+│   ├── migrator-service.yaml           ClusterIP Service
+│   ├── migrator-tsdb-pvc.yaml          PVC template for TSDB hostPath
+│   └── migrator-deployment.yaml
 ├── grafana-monitor-system-main-grafana-dashboards-general/
 │                                   Grafana dashboard JSON (bulk-imported)
 └── get-token.sh                    Keystone token helper (env-var overridable)
@@ -173,7 +221,7 @@ Conventions worth knowing before adding code:
 | Add an HTTP endpoint | handler → `internal/api/handlers.go`, route → `internal/api/server.go` (`NewServer`), interface → `server.go` if a new dep is needed, then test in `handlers_test.go` |
 | Add a new pipeline stage | modify `internal/migration/pipeline.go` — keep it `errgroup`-orchestrated |
 | Add a new CLI tool | new dir under `services/migrator/cmd/<name>/` using the `parseFlags` / `run` split pattern (see `cmd/revert-overrides`) |
-| Add a k8s manifest | `deploy/new-cluster/<kebab-case>.yaml` with label `app.kubernetes.io/name: migrator` |
+| Add a k8s manifest | `deploy/<kebab-case>.yaml` with label `app.kubernetes.io/name: migrator` or appropriate component label |
 | Add a shared package | new `services/migrator/internal/<name>/` — do not stash shared code inside `api/` |
 
 ---
@@ -196,14 +244,39 @@ Conventions worth knowing before adding code:
   The migrator pod is pinned to a single node via `nodeSelector` because it
   reads the TSDB through a `hostPath` volume — see
   [Known limitations](#known-limitations) below. Edit the `nodeSelector` in
-  `deploy/new-cluster/migrator-deployment.yaml` to match your node name
-  before running `deploy.sh`.
+  `deploy/migrator-deployment.yaml` to match your node name.
 - An S3-compatible object store for Mimir with three buckets (`blocks`,
   `ruler`, `alerts`). All three must exist before deploy — a non-existent
   bucket is a hard failure, not a warning.
 - A reachable OpenStack Keystone endpoint (Keystone v3, password auth).
 - A public gateway URL / node-port for APISIX (used by Grafana for
   `root_url` and by the Lua plugins as the token-redirect target).
+
+### Cluster resource requirements
+
+The full stack deploys 28 pods. Total resource **requests** at default
+settings:
+
+| Component | Pods | CPU request | Memory request | Storage |
+|---|---:|---|---|---|
+| Mimir (all components)¹ | 18 | 1.5 CPU | 4.5 Gi | S3 (remote) + local PVCs for WAL/cache |
+| Mimir Kafka | 1 | 1 CPU | 1 Gi | 5 Gi PVC |
+| Migrator | 1 | 2 CPU | 8 Gi | hostPath (read-only TSDB) |
+| APISIX + etcd (×3) | 4 | 750m | 768 Mi | 3× 8 Gi PVC (etcd) |
+| cortex-tenant (×2) | 2 | 200m | 256 Mi | — |
+| Grafana | 1 | 100m | 128 Mi | 1 Gi PVC |
+| Redis | 1 | 50m | 64 Mi | 1 Gi PVC |
+| **Total** | **28** | **~5.6 CPU** | **~14.7 Gi** | **~50 Gi PVC + S3** |
+
+¹ Includes distributor, ingesters (×3 zones), store-gateways (×3 zones),
+queriers (×2), query-frontend, query-scheduler (×2), compactor,
+alertmanager, ruler, overrides-exporter, rollout-operator, gateway.
+
+Mimir component resource requests come from the `mimir-distributed`
+chart defaults and are not overridden in `mimir-values.yaml`. The
+migrator is the heaviest single pod (2 CPU / 8 Gi request, up to
+6 CPU / 28 Gi limit during active migration). To adjust its resource
+allocation, edit the `resources` block in `deploy/migrator-deployment.yaml`.
 
 ### Required environment variables for `deploy.sh`
 
@@ -232,28 +305,37 @@ export DRY_RUN=true                # print commands instead of executing
 
 ## Deploying a fresh cluster
 
-`deploy/new-cluster/deploy.sh` is the single source of truth. It is idempotent (`helm upgrade --install`) and safe to re-run.
+All `deploy/` scripts run **on the k3s master node** (where `kubectl` and `helm` have direct cluster access). `deploy.sh` is the single entry point. It is idempotent (`helm upgrade --install`) and safe to re-run.
 
 ### 1. Build and load the migrator image
 
-`migrator-deployment.yaml` uses `imagePullPolicy: Never` and expects the image to exist locally on the worker node. Pick the flow that matches your cluster:
+`migrator-deployment.yaml` uses `imagePullPolicy: Never` and expects the
+image to exist in the target node's containerd image store. Use
+`rebuild-migrator.sh` to automate the build → save → scp → import →
+rollout sequence:
 
 ```bash
-# Option A: plain Docker → single-node / kind-style
-cd services/migrator
-docker build -t docker.io/nipa-mimir/migrator:latest .
-
-# Option B: remote worker — save and scp
-docker save docker.io/nipa-mimir/migrator:latest \
-  | ssh worker 'docker load'     # or containerd: `| ssh worker ctr -n k8s.io images import -`
+cd deploy
+TARGET_NODE_PASS='your-ssh-password' ./rebuild-migrator.sh
 ```
 
-If you'd rather pull from a registry, change `imagePullPolicy` to `IfNotPresent` and push to your registry.
+The script accepts these environment overrides for SSH access to the
+target worker node:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TARGET_NODE_HOST` | *(required)* | SSH host of the worker node pinned by `nodeSelector` |
+| `TARGET_NODE_USER` | `nc-user` | SSH user |
+| `TARGET_NODE_PASS` | *(empty — assumes key auth)* | SSH password (used via `sshpass`) |
+
+Edit these defaults in the script header or export them before running.
+If your cluster uses a registry instead, change `imagePullPolicy` to
+`IfNotPresent` in `migrator-deployment.yaml` and push to your registry.
 
 ### 2. Run the deploy script
 
 ```bash
-cd deploy/new-cluster
+cd deploy
 ./deploy.sh
 ```
 
@@ -272,7 +354,8 @@ What it does, step by step (matches `deploy.sh` exactly):
 | 9 | Wait for all pods Ready | 300 s timeout |
 | 10 | PUT APISIX routes | via admin API from inside the APISIX pod (uses `/dev/tcp` because the pod has no curl) |
 | 11 | Apply **migrator** RBAC, Service, PVC, Deployment | requires the image from step 1 to be loaded on the target node |
-| 12 | Run `verify.sh` | see next section |
+| 12 | Import **Grafana dashboards** | runs `import-dashboards.sh` inline |
+| 13 | Run `verify.sh` | see next section |
 
 > **Dry-run first.** `DRY_RUN=true ./deploy.sh` will print every command without executing — highly recommended on a first run against a real cluster.
 
@@ -281,7 +364,7 @@ What it does, step by step (matches `deploy.sh` exactly):
 `verify.sh` runs a battery of health checks:
 
 ```bash
-cd deploy/new-cluster
+cd deploy
 ./verify.sh
 ```
 
@@ -298,7 +381,7 @@ It checks:
 ### 4. Import dashboards
 
 ```bash
-cd deploy/new-cluster
+cd deploy
 ./import-dashboards.sh
 ```
 
@@ -342,7 +425,7 @@ and the port-forward into a single command.
 ### The easy way: `run-migration.sh`
 
 ```bash
-cd deploy/new-cluster
+cd deploy
 
 # Kick off a migration for one tenant
 ./run-migration.sh run <tenant-id>
@@ -351,7 +434,7 @@ cd deploy/new-cluster
 ./run-migration.sh run tenantA tenantB tenantC
 
 # Big batch — tenant IDs in a file, one per line, `#` comments allowed
-./run-migration.sh run -f deploy/new-cluster/tenants.txt
+./run-migration.sh run -f deploy/tenants.txt
 
 # Kick off 30 tenants and block until the whole fleet finishes
 ./run-migration.sh run --wait -f tenants.txt
@@ -566,123 +649,93 @@ kubectl -n monitoring set env deployment/migrator DRY_RUN=true
 kubectl -n monitoring set env deployment/migrator DRY_RUN=false
 ```
 
-Or use `deploy/new-cluster/dry-run.sh` which wraps this plus an end-to-end verification.
-
----
-
-## Day-2 operations
-
-### Reverting per-tenant overrides
-
-After a migration, the per-tenant OOO + rate-limit overrides are still in the `mimir-runtime` ConfigMap. To remove them cleanly (without touching any tenant you didn't migrate):
-
-**Option A — from inside the migrator pod** (uses the bundled binary):
-
-```bash
-POD=$(kubectl -n monitoring get pod -l app.kubernetes.io/name=migrator -o jsonpath='{.items[0].metadata.name}')
-kubectl -n monitoring exec "$POD" -- /revert-overrides -tenants=tenantA,tenantB
-```
-
-**Option B — as a `kubectl run` one-shot:**
-
-```bash
-kubectl -n monitoring run revert --rm -it --restart=Never \
-  --image=docker.io/nipa-mimir/migrator:latest \
-  --serviceaccount=migrator \
-  --command -- /revert-overrides -tenants=tenantA,tenantB
-```
-
-The CLI calls `mimirconfig.Client.RevertOverrides()` which deletes only the listed keys via a merge patch. Other tenants' overrides are untouched.
-
-### Logs
-
-The service logs structured JSON on stdout via `log/slog`:
-
-```bash
-kubectl -n monitoring logs -f deploy/migrator
-```
-
-Every log line has a `component` field (`api`, `queue`, `migration`, `tsdb`, `remotewrite`, `mimirconfig`, `cortexcheck`) for filtering.
-
-### Metrics
-
-The migrator **does not** expose a `/metrics` endpoint today. If you need
-visibility, scrape Mimir itself (it's self-instrumented) or add a
-Prometheus client registry.
+Or use `deploy/dry-run.sh` which wraps this plus an end-to-end verification.
 
 ---
 
 ## Known limitations
 
-These are design choices that keep the deployment simple for a one-shot
-migration of a fixed dataset. Re-evaluate them if you plan to run this
-continuously or against multiple source datasets.
+These are design choices and operational notes that keep the deployment
+simple for a one-shot migration. Re-evaluate them if you plan to run
+this continuously.
 
-### Kafka `message.max.bytes` must be raised above the default
+### Kafka message size limits
 
-The mimir-distributed chart runs a Kafka broker as the ingest-storage
-backend (Mimir 3.x). Kafka's default `message.max.bytes` is ~1 MiB, which
-is too small for the migrator's bulk-write batches (1–3 MiB each). Hitting
-the limit produces a misleading Mimir error:
+mimir-distributed 6.0.6 uses Kafka for ingest storage. The default
+`message.max.bytes` (~1 MiB) is too small for bulk-migration batches.
+`mimir-values.yaml` raises `KAFKA_MESSAGE_MAX_BYTES`,
+`KAFKA_REPLICA_FETCH_MAX_BYTES`, and `KAFKA_SOCKET_REQUEST_MAX_BYTES`
+to 100 MiB via `kafka.extraEnv`. If you are deploying into an existing
+cluster not managed by this repo, patch the StatefulSet directly:
 
+```bash
+kubectl -n monitoring set env sts/mimir-kafka \
+  KAFKA_MESSAGE_MAX_BYTES=104857600 \
+  KAFKA_REPLICA_FETCH_MAX_BYTES=104857600 \
+  KAFKA_SOCKET_REQUEST_MAX_BYTES=104857600
 ```
-remote write failed: HTTP 400: send data to partitions:
-failed pushing to partition 0: the write request contains a
-timeseries or metadata item which is larger that the maximum
-allowed size of 15983616 bytes
-(err-mimir-distributor-max-write-request-data-item-size)
+
+**Important:** the chart key is `kafka.extraEnv`, **not**
+`kafka.extraEnvVars` (the bitnami convention). The latter is silently
+ignored — confirmed via
+`helm show values grafana/mimir-distributed --version 6.0.6`.
+
+### Migrator `runAsUser` must match the TSDB owner
+
+The source TSDB directory is typically owned by UID 65534 (the Linux
+`nobody` user, which is also the Prometheus container default). The
+migrator image (`gcr.io/distroless/static:nonroot`) defaults to UID
+65532. The pod can read block data (directory is 0755) but cannot
+create the TSDB lock file required by `promtsdb.Open`.
+`migrator-deployment.yaml` sets
+`securityContext.runAsUser/runAsGroup/fsGroup: 65534`. If your TSDB
+has different ownership, adjust those three fields to match.
+
+### `mimir-gateway` service name (not `mimir-nginx`)
+
+mimir-distributed 6.0.6 names the gateway service `mimir-gateway`.
+Older charts used `mimir-nginx`. Both `cortex-tenant-values.yaml`
+and `apisix-routes.json` must reference `mimir-gateway`.
+
+### Post-migration query visibility delay
+
+After a bulk migration completes, data is in S3 but must propagate
+through the compactor bucket-index update and store-gateway sync
+before queries return results. With Mimir defaults (15 min each)
+this takes up to 30 minutes. `mimir-values.yaml` overrides both
+intervals to 1 minute:
+
+```yaml
+blocks_storage:
+  bucket_store:
+    sync_interval: 1m
+compactor:
+  cleanup_interval: 1m
 ```
 
-The reported 15 MiB limit in that error is **not** the real cap —
-mimir-distributor's logs show the underlying Kafka `MESSAGE_TOO_LARGE`
-rejection. `mimir-values.yaml` in this repo bumps
-`KAFKA_MESSAGE_MAX_BYTES` / `KAFKA_REPLICA_FETCH_MAX_BYTES` /
-`KAFKA_SOCKET_REQUEST_MAX_BYTES` to 100 MiB via `kafka.extraEnvVars`, so a
-fresh `deploy.sh` run bakes in the fix automatically. If you are
-migrating into a pre-existing cluster that wasn't deployed from this
-repo, apply the same env vars to the `mimir-kafka` StatefulSet by hand.
+If you revert to defaults, expect a delay after migrations — or
+restart `mimir-compactor-0` and the store-gateway pods to force an
+immediate sync.
 
-### Single migrator replica pinned to one node
+### Single migrator replica
 
-The migrator reads the source TSDB through a `hostPath` volume mounted
-read-write at `/data/tsdb`, so the pod is pinned to one worker node via
-`nodeSelector`. Consequences:
-
-- `replicas: 1` is the only supported configuration out of the box.
-- If the pinned node is drained or fails, the migrator cannot reschedule
-  elsewhere until the TSDB dump is copied to another node and the
-  `nodeSelector` is updated.
-- Horizontal scaling would require either (a) copying the TSDB to every
-  eligible node, (b) moving the dump to an RWX `PersistentVolumeClaim`
-  backed by NFS / CephFS / similar, or (c) sharding the migration payload
-  to smaller units than "one tenant" so asynq can fan work out across
-  replicas. None of these are implemented — the current design trades
-  horizontal scale for operational simplicity.
-
-This limitation does **not** affect read-path tenancy or steady-state
-ingest through `cortex-tenant` — only the migration write path.
+The migrator is pinned to one worker node via `nodeSelector` because
+it reads the source TSDB through a hostPath volume.
+`replicas: 1` is the only supported configuration. This does not
+affect steady-state ingest through `cortex-tenant`.
 
 ### Per-tenant work granularity
 
-The migration queue enqueues **one asynq task per tenant**
-(`MigratePayload.ProjectID`). Parallelism within a tenant is limited to
-the writer-goroutine pool inside the pipeline (default 4 writers). If a
-single tenant's TSDB slice is huge, a single task will still take as long
-as that slice takes — splitting across workers requires a code change to
-the payload shape.
+The migration queue enqueues one asynq task per tenant. Parallelism
+within a tenant is limited to the writer-goroutine pool (default 4
+writers, configured via `WRITER_CONCURRENCY`). The 4 writers pull
+from a shared batch channel — they do not write overlapping data.
 
 ### Ephemeral history log
 
-`/var/log/migrator/history.jsonl` lives on an `emptyDir` volume — it is
-lost when the pod restarts. If you need durable migration history, change
-the `history-log` volume in `migrator-deployment.yaml` to a PVC or
-hostPath.
-
-### No `/metrics` endpoint on the migrator
-
-Covered above. Mimir itself is self-instrumented, so operational metrics
-for the wider stack are available once Mimir is up; the migrator's own
-throughput is only visible via its `/status` API and `history.jsonl`.
+`/var/log/migrator/history.jsonl` lives on an `emptyDir` volume and
+is lost on pod restart. Change the volume to a PVC if you need
+durable history.
 
 ---
 
@@ -717,7 +770,7 @@ go run ./cmd/server
 
 ```bash
 cd services/migrator
-docker build -t docker.io/nipa-mimir/migrator:latest .
+docker build -t docker.io/mimir-openstack-tenant-migrator/migrator:latest .
 ```
 
 The Dockerfile is a multi-stage build: `golang:1.25-alpine` for compilation (static `CGO_ENABLED=0`, `-trimpath -ldflags="-s -w"`), then `gcr.io/distroless/static:nonroot` for the runtime image.
@@ -728,14 +781,12 @@ The Dockerfile is a multi-stage build: `golang:1.25-alpine` for compilation (sta
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Migrator pod `CrashLoopBackOff`, logs say `CORTEX_URL must end with /push` | `CORTEX_URL` env var missing `/push` suffix | update `migrator-deployment.yaml` — the boot-time `cortexcheck.Probe` is doing its job |
-| Migrator pod `CrashLoopBackOff`, logs say `cortexcheck: ...` | cortex-tenant not reachable / not Ready | `kubectl -n monitoring get pods -l app.kubernetes.io/name=cortex-tenant`; check the service/endpoints |
-| Migration tasks fail with `out of order sample` in Mimir | the OOO override didn't apply | check the `mimir-runtime` ConfigMap has an `overrides.<tenant>.out_of_order_time_window: 2880h` key — `kubectl -n monitoring get cm mimir-runtime -o yaml` |
-| Migration tasks fail with `rate limit exceeded` | the ingestion rate/burst override didn't apply | same as above — look for `ingestion_rate` / `ingestion_burst_size` under the tenant |
-| `POST /migrate` returns 500 `failed to apply mimir overrides` | migrator SA lacks `patch configmaps` in `monitoring` | `kubectl apply -f deploy/new-cluster/migrator-rbac.yaml` |
-| `POST /migrate` returns 500, logs mention `kubernetes` | pod not running in-cluster and no `KUBECONFIG` | expected when running locally — you'll fall back to `NoopApplier` automatically only when `KUBECONFIG` is unset *and* there's no in-cluster config |
-| Unauthenticated `GET /prometheus/labels` returns 200 through APISIX | Lua plugin ConfigMap missing / not mounted | `kubectl -n monitoring get cm configmap-mimir-keystone-authz`; check APISIX logs for plugin load errors |
-| `mimir-ruler` pod in `CrashLoopBackOff`, logs: `ruler storage: ... bucket does not exist` | the ruler's sanity-check aborts if its S3 bucket is missing — this **is** blocking. An *empty* bucket is fine; a *non-existent* bucket crash-loops the pod. Typos in `MIMIR_S3_BUCKET_RULER` are a common cause. | `kubectl -n monitoring get cm mimir-config -o jsonpath='{.data.mimir\.yaml}' \| grep -A2 ruler_storage` — create the bucket or fix the name, then `kubectl -n monitoring rollout restart deploy/mimir-ruler` |
-| Migration tasks fail with `HTTP 429: the request has been limited` after ~240k samples | per-tenant `ingestion_rate` / `ingestion_burst_size` overrides not applied — Mimir's default 10k/s rate + 200k burst is far below what a bulk migration needs. | Verify `kubectl -n monitoring get cm mimir-runtime -o yaml` contains an `overrides.<tenant>` block with `ingestion_rate: 1000000` and `ingestion_burst_size: 2000000`; if not, either grant the migrator ServiceAccount patch permission (`migrator-rbac.yaml`) or patch the ConfigMap by hand before enqueueing. |
-| Pod stuck `Pending` on scheduling | `nodeSelector` doesn't match any node | edit `migrator-deployment.yaml` to match your node's `kubernetes.io/hostname`, reapply |
-| TSDB volume empty in pod | `hostPath` directory doesn't exist on the selected node | mount / bind-mount the source Prometheus data dir there, or change the volume to a PVC |
+| Migrator pod `CrashLoopBackOff`, logs say `CORTEX_URL must end with /push` | `CORTEX_URL` env var missing `/push` suffix | Update `migrator-deployment.yaml` |
+| Migrator pod `CrashLoopBackOff`, logs say `cortexcheck: ...` | cortex-tenant not reachable | `kubectl -n monitoring get pods -l app.kubernetes.io/name=cortex-tenant` |
+| Migration tasks fail with `out of order sample` | OOO override didn't apply | Check `mimir-runtime` ConfigMap has `overrides.<tenant>.out_of_order_time_window: 2880h` |
+| Migration tasks fail with `rate limit exceeded` | Ingestion rate override didn't apply | Check `mimir-runtime` ConfigMap has `ingestion_rate` / `ingestion_burst_size` under the tenant |
+| `POST /migrate` returns 500 `failed to apply mimir overrides` | Migrator SA lacks RBAC | `kubectl apply -f deploy/migrator-rbac.yaml` |
+| Unauthenticated `GET /prometheus/labels` returns 200 through APISIX | Lua plugin ConfigMap missing | Check `kubectl -n monitoring get cm mimir-keystone-authz-plugin`; check APISIX logs |
+| Migration tasks fail with `HTTP 429` after ~240k samples | Default 10k/s rate limit in effect | Verify `mimir-runtime` ConfigMap overrides; check migrator SA has `patch configmaps` permission |
+| Pod stuck `Pending` on scheduling | `nodeSelector` mismatch | Edit `migrator-deployment.yaml` to match your node's `kubernetes.io/hostname` |
+| Queries return empty after successful migration | Compactor/store-gateway sync delay | Wait 1–2 minutes (with tuned intervals) or restart `mimir-compactor-0` and store-gateway pods |

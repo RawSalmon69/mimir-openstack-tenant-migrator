@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
 # Usage: ./get-token.sh [password]
 #
-# Gets a Keystone token scoped to the DevOps-Prototype project, verifies Mimir +
-# Grafana via APISIX, and prints a single browser URL that sets the cookie and
-# lands you in Grafana.
+# Gets a Keystone token scoped to your project, verifies Mimir + Grafana via
+# APISIX, and prints a single browser URL that sets the cookie and lands you
+# in Grafana.
 #
 # What you'll see in Grafana depends on your Keystone roles:
 #   - If your user has the `nipa_grafana_admin` role, the APISIX Lua plugin
-#     bypasses tenant scoping and gives you a cross-tenant ("admin") view —
-#     you'll see data for every tenant currently ingesting into Mimir.
-#   - Otherwise the plugin scopes you to your project_id (DevOps-Prototype:
-#     2311af1e47bf4cb3b69b2494370e7657). That tenant is currently empty in
-#     Mimir, so the dashboards will return no data.
+#     bypasses tenant scoping and gives you a cross-tenant ("admin") view.
+#   - Otherwise the plugin scopes you to your project_id, and dashboards
+#     only show data for that tenant.
 #
 # Override defaults via env vars:
-#   APISIX_HOST   default: 183.90.173.188:31545 (master node, public NodePort)
-#   OS_AUTH_URL   default: https://identity-api.nipa.cloud/
-#   OS_USERNAME   default: 6633165121@student.chula.ac.th
-#   OS_PROJECT_ID default: 2311af1e47bf4cb3b69b2494370e7657 (DevOps-Prototype)
+#   APISIX_HOST   default: <master-ip>:31545 (master node, public NodePort)
+#   OS_AUTH_URL   Keystone auth URL
+#   OS_USERNAME   OpenStack username
+#   OS_PROJECT_ID OpenStack project UUID
 
 set -euo pipefail
 
-OS_AUTH_URL="${OS_AUTH_URL:-https://identity-api.nipa.cloud/}"
-OS_PROJECT_ID="${OS_PROJECT_ID:-2311af1e47bf4cb3b69b2494370e7657}"
-OS_USERNAME="${OS_USERNAME:-6633165121@student.chula.ac.th}"
-OS_USER_DOMAIN_NAME="${OS_USER_DOMAIN_NAME:-nipacloud}"
-APISIX_HOST="${APISIX_HOST:-183.90.173.188:31545}"
+OS_AUTH_URL="${OS_AUTH_URL:?ERROR: OS_AUTH_URL is required (Keystone auth URL)}"
+OS_PROJECT_ID="${OS_PROJECT_ID:?ERROR: OS_PROJECT_ID is required (OpenStack project UUID)}"
+OS_USERNAME="${OS_USERNAME:?ERROR: OS_USERNAME is required (OpenStack username)}"
+OS_USER_DOMAIN_NAME="${OS_USER_DOMAIN_NAME:?ERROR: OS_USER_DOMAIN_NAME is required}"
+APISIX_HOST="${APISIX_HOST:?ERROR: APISIX_HOST is required (e.g. <master-ip>:31545)}"
 
 PASSWORD="${1:-}"
 if [ -z "$PASSWORD" ]; then
@@ -82,7 +80,7 @@ echo ""
 echo "     http://${APISIX_HOST}/set-token?token=${ENCODED_TOKEN}"
 echo ""
 echo "  (If APISIX_HOST is not directly reachable, set up an SSH tunnel first:"
-echo "     ssh -L 31545:183.90.173.188:31545 nc-user@183.90.173.188"
+echo "     ssh -L 31545:<master-ip>:31545 <user>@<master-ip>"
 echo "   then re-run this script with APISIX_HOST=localhost:31545)"
 echo ""
 
