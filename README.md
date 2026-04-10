@@ -1,4 +1,4 @@
-# NIPA-Mimir
+# [mimir-openstack-tenant-migrator](https://github.com/RawSalmon69/mimir-openstack-tenant-migrator)
 
 A Go migration service that streams historical Prometheus TSDB blocks into
 Grafana Mimir on a per-tenant basis, plus the Kubernetes deployment stack
