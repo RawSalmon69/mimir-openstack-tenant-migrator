@@ -695,3 +695,73 @@ func (o *orderTrackingEnqueuer) Enqueue(task *asynq.Task, opts ...asynq.Option) 
 	*o.events = append(*o.events, callEvent{kind: "enqueue"})
 	return o.inner.Enqueue(task, opts...)
 }
+
+// --- /readyz tests ---
+
+func TestReadyz_NotReady(t *testing.T) {
+	mux := NewServer(ServerConfig{
+		ReadinessFunc: func() bool { return false },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "not ready") {
+		t.Errorf("expected body to contain 'not ready', got %q", w.Body.String())
+	}
+}
+
+func TestReadyz_Ready(t *testing.T) {
+	mux := NewServer(ServerConfig{
+		ReadinessFunc: func() bool { return true },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "ready") {
+		t.Errorf("expected body to contain 'ready', got %q", w.Body.String())
+	}
+}
+
+// TestReadyz_NoFuncDefaultsReady documents the behavior when no ReadinessFunc
+// is wired (e.g. tests, local dev): /readyz returns 200. Production must wire
+// ReadinessFunc: ready.Load — see cmd/server/main.go.
+func TestReadyz_NoFuncDefaultsReady(t *testing.T) {
+	mux := NewServer(ServerConfig{}) // no ReadinessFunc
+
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (nil func defaults to ready), got %d", w.Code)
+	}
+}
+
+// TestHealthz_AlwaysOK_AfterReadyzAdded guards against /readyz registration
+// accidentally clobbering /healthz.
+func TestHealthz_AlwaysOK_AfterReadyzAdded(t *testing.T) {
+	mux := NewServer(ServerConfig{
+		ReadinessFunc: func() bool { return false },
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected /healthz to always return 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Errorf("expected body 'ok', got %q", w.Body.String())
+	}
+}

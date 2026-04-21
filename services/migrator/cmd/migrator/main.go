@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/NIPA-Mimir/services/migrator/internal/migration"
+	"github.com/NIPA-Mimir/services/migrator/internal/tsdb"
 )
 
 func main() {
@@ -37,7 +38,6 @@ func main() {
 	defer cancel()
 
 	cfg := migration.PipelineConfig{
-		TSDBPath:          *tsdbPath,
 		TenantID:          *tenant,
 		CortexURL:         *cortexURL,
 		MaxBatchBytes:     *maxBatchBytes,
@@ -46,6 +46,18 @@ func main() {
 		MinTime:           *minTime,
 		MaxTime:           *maxTime,
 	}
+
+	provider, closer, err := tsdb.OpenProvider(*tsdbPath, logger)
+	if err != nil {
+		logger.Error("failed to open TSDB", "err", err, "tsdb_path", *tsdbPath)
+		os.Exit(1)
+	}
+	defer func() {
+		if cErr := closer.Close(); cErr != nil {
+			logger.Warn("closing TSDB", "err", cErr)
+		}
+	}()
+	cfg.Provider = provider
 
 	progress := func(seriesRead, samplesRead int) {
 		fmt.Fprintf(os.Stderr, "\r  series: %d  samples: %d", seriesRead, samplesRead)

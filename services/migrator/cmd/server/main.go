@@ -4,12 +4,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/NIPA-Mimir/services/migrator/internal/cortexcheck"
 	"github.com/NIPA-Mimir/services/migrator/internal/mimirconfig"
 	"github.com/NIPA-Mimir/services/migrator/internal/queue"
+	"github.com/NIPA-Mimir/services/migrator/internal/tsdb"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 	"k8s.io/client-go/kubernetes"
@@ -39,8 +42,13 @@ func main() {
 		"max_batch_bytes", cfg.maxBatchBytes,
 		"writer_concurrency", cfg.writerConcurrency,
 		"queue_concurrency", cfg.queueConcurrency,
+		"asynq_shutdown_timeout_seconds", cfg.asynqShutdownTimeoutSeconds,
 		"dry_run", cfg.dryRun,
 	)
+
+	// ready flips to true after the shared TSDB open succeeds. Read by the
+	// /readyz handler in internal/api via cfg.ReadinessFunc (wired in Plan 02).
+	var ready atomic.Bool
 
 	if err := cortexcheck.Probe(context.Background(), cfg.cortexURL, logger); err != nil {
 		logger.Error("cortex_url validation failed", "err", err)
@@ -113,19 +121,39 @@ func main() {
 	inspector := asynq.NewInspector(asynq.RedisClientOpt{Addr: cfg.redisAddr})
 	defer inspector.Close()
 
+	// Open the shared TSDB once at startup; the closer runs after asynq
+	// drain during shutdown. ready.Store(true) flips /readyz to 200.
+	sharedProvider, dbCloser, err := tsdb.OpenProvider(cfg.tsdbPath, logger)
+	if err != nil {
+		logger.Error("failed to open shared TSDB", "path", cfg.tsdbPath, "err", err)
+		os.Exit(1)
+	}
+	logger.Info("shared TSDB opened", "path", cfg.tsdbPath)
+	ready.Store(true)
+
 	asynqServer := asynq.NewServer(
 		asynq.RedisClientOpt{Addr: cfg.redisAddr},
 		asynq.Config{
-			Concurrency: cfg.queueConcurrency,
-			Queues:      map[string]int{"migration": 10, "default": 1},
-			Logger:      newAsynqLogger(logger),
+			Concurrency:     cfg.queueConcurrency,
+			Queues:          map[string]int{"migration": 10, "default": 1},
+			Logger:          newAsynqLogger(logger),
+			ShutdownTimeout: time.Duration(cfg.asynqShutdownTimeoutSeconds) * time.Second,
 		},
 	)
 
+	// Closure returns the shared provider; the per-task closer is a no-op
+	// because the DB is closed in the shutdown sequence below.
 	handler := &queue.MigrationHandler{
 		Store:   progressStore,
 		Logger:  logger,
 		History: historyLogger,
+		OpenProvider: func(path string) (tsdb.QuerierProvider, io.Closer, error) {
+			if path != "" && path != cfg.tsdbPath {
+				logger.Warn("task TSDB path differs from server config — using shared provider opened from server cfg",
+					"task_path", path, "server_path", cfg.tsdbPath)
+			}
+			return sharedProvider, noopCloser{}, nil
+		},
 	}
 
 	asynqMux := asynq.NewServeMux()
@@ -143,6 +171,7 @@ func main() {
 		WriterConcurrency: cfg.writerConcurrency,
 		DryRun:            cfg.dryRun,
 		Logger:            logger,
+		ReadinessFunc:     ready.Load,
 	})
 
 	httpServer := &http.Server{
@@ -173,8 +202,19 @@ func main() {
 	sig := <-sigCh
 	logger.Info("received signal, shutting down", "signal", sig)
 
+	// Drain asynq workers first so no goroutine is mid-Select on the
+	// shared DB when it closes.
 	asynqServer.Shutdown()
+	logger.Info("asynq drain complete")
 
+	if cErr := dbCloser.Close(); cErr != nil {
+		logger.Error("shared TSDB close error", "err", cErr)
+	} else {
+		logger.Info("shared TSDB closed")
+	}
+
+	// HTTP shutdown is independent of the DB — handlers don't read the DB
+	// directly. Bounded so the pod exits inside terminationGracePeriodSeconds.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(ctx); err != nil {
@@ -186,28 +226,30 @@ func main() {
 }
 
 type config struct {
-	redisAddr         string
-	tsdbPath          string
-	cortexURL         string
-	historyLogPath    string
-	maxBatchBytes     int
-	writerConcurrency int
-	queueConcurrency  int
-	httpAddr          string
-	dryRun            bool
+	redisAddr                   string
+	tsdbPath                    string
+	cortexURL                   string
+	historyLogPath              string
+	maxBatchBytes               int
+	writerConcurrency           int
+	queueConcurrency            int
+	httpAddr                    string
+	dryRun                      bool
+	asynqShutdownTimeoutSeconds int
 }
 
 func loadConfig() (config, error) {
 	c := config{
-		redisAddr:         envOrDefault("REDIS_ADDR", "localhost:6379"),
-		tsdbPath:          envOrDefault("TSDB_PATH", "/data/tsdb"),
-		cortexURL:         envOrDefault("CORTEX_URL", "http://localhost:8080"),
-		historyLogPath:    envOrDefault("HISTORY_LOG_PATH", "/var/log/migrator/history.jsonl"),
-		httpAddr:          envOrDefault("HTTP_ADDR", ":8090"),
-		maxBatchBytes:     3 * 1024 * 1024,
-		writerConcurrency: 4,
-		queueConcurrency:  1,
-		dryRun:            false,
+		redisAddr:                   envOrDefault("REDIS_ADDR", "localhost:6379"),
+		tsdbPath:                    envOrDefault("TSDB_PATH", "/data/tsdb"),
+		cortexURL:                   envOrDefault("CORTEX_URL", "http://localhost:8080"),
+		historyLogPath:              envOrDefault("HISTORY_LOG_PATH", "/var/log/migrator/history.jsonl"),
+		httpAddr:                    envOrDefault("HTTP_ADDR", ":8090"),
+		maxBatchBytes:               3 * 1024 * 1024,
+		writerConcurrency:           4,
+		queueConcurrency:            1,
+		dryRun:                      false,
+		asynqShutdownTimeoutSeconds: 100,
 	}
 
 	if v := os.Getenv("MAX_BATCH_BYTES"); v != "" {
@@ -230,6 +272,13 @@ func loadConfig() (config, error) {
 			return c, fmt.Errorf("invalid QUEUE_CONCURRENCY: %w", err)
 		}
 		c.queueConcurrency = n
+	}
+	if v := os.Getenv("ASYNQ_SHUTDOWN_TIMEOUT_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return c, fmt.Errorf("invalid ASYNQ_SHUTDOWN_TIMEOUT_SECONDS: %w", err)
+		}
+		c.asynqShutdownTimeoutSeconds = n
 	}
 	if v := os.Getenv("DRY_RUN"); v == "true" || v == "1" {
 		c.dryRun = true
@@ -264,3 +313,9 @@ func (a *asynqLogAdapter) Fatal(args ...interface{}) {
 	a.logger.Error(fmt.Sprint(args...))
 	os.Exit(1)
 }
+
+// noopCloser is returned by the handler closure so per-task Close() does
+// not close the shared TSDB; shutdown owns that lifecycle.
+type noopCloser struct{}
+
+func (noopCloser) Close() error { return nil }

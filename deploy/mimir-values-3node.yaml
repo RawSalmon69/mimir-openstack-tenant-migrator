@@ -1,0 +1,292 @@
+# Mimir Helm values — 3-node HA profile (1 master + 2 workers). Mimir
+# pods are pinned to workers via nodeAffinity so the k3s control plane
+# stays clean. Pairs with deploy/mimir-values.yaml (2-node profile) —
+# pick whichever matches the cluster size.
+mimir:
+  structuredConfig:
+    multitenancy_enabled: true
+
+    common:
+      storage:
+        backend: s3
+        s3:
+          endpoint: "${MIMIR_S3_ENDPOINT}"
+          access_key_id: "${MIMIR_S3_ACCESS_KEY}"
+          secret_access_key: "${MIMIR_S3_SECRET_KEY}"
+          region: "${MIMIR_S3_REGION}"
+          http:
+            insecure_skip_verify: true
+          insecure: false
+
+    blocks_storage:
+      s3:
+        bucket_name: "${MIMIR_S3_BUCKET_BLOCKS}"
+      bucket_store:
+        sync_interval: 1m
+
+    compactor:
+      cleanup_interval: 1m
+
+    # Use all available cores for ingester WAL replay at startup. Chart
+    # default is 3 which bottlenecks recovery time when many tenants'
+    # TSDBs are on disk. 0 = GOMAXPROCS (upstream default).
+    blocks_storage:
+      tsdb:
+        wal_replay_concurrency: 0
+
+    # Lift global ingestion and OOO defaults so bulk migration does not
+    # depend on per-tenant runtime_config reload (which is unreliable on
+    # chart v6.0.6). Safe because the migrator is the only writer.
+    limits:
+      ingestion_rate: 10000000
+      ingestion_burst_size: 20000000
+      out_of_order_time_window: 2880h
+      max_global_series_per_user: 0
+
+    # Mimir v6.0.6 uses Kafka-backed ingest-storage. Chart defaults
+    # (2 partitions, 10s write_timeout) saturate under high migrator
+    # concurrency and reject writes with "records have timed out before
+    # they were able to be produced". Raise write_timeout and producer
+    # buffer; partitions are raised below under kafka.extraEnv.
+    ingest_storage:
+      kafka:
+        topic: ingest
+        write_timeout: 30s
+        producer_max_buffered_bytes: 2147483648   # 2 GiB per producer (default 1 GiB)
+        address: mimir-kafka.monitoring.svc.cluster.local:9092
+
+    ruler_storage:
+      s3:
+        bucket_name: "${MIMIR_S3_BUCKET_RULER}"
+
+    alertmanager_storage:
+      s3:
+        bucket_name: "${MIMIR_S3_BUCKET_ALERTS}"
+
+minio:
+  enabled: false
+
+# Kafka: worker-only, 100 MiB message cap for bulk remote-write batches.
+kafka:
+  extraEnv:
+    - name: KAFKA_MESSAGE_MAX_BYTES
+      value: "104857600"
+    - name: KAFKA_REPLICA_FETCH_MAX_BYTES
+      value: "104857600"
+    - name: KAFKA_SOCKET_REQUEST_MAX_BYTES
+      value: "104857600"
+    # 8 partitions spreads producer queue depth under high migrator
+    # fan-out. Takes effect only on topic CREATION — re-using existing
+    # Kafka requires deleting and recreating the topic (helm uninstall
+    # + PVC delete is the simplest path).
+    - name: KAFKA_CFG_NUM_PARTITIONS
+      value: "8"
+    - name: KAFKA_CFG_DEFAULT_REPLICATION_FACTOR
+      value: "1"
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+# ── 3-node HA topology ────────────────────────────────────────────────────
+# Keep every Mimir data-plane pod on workers only (exclude master).
+# Use podAntiAffinity so replicas spread across both workers.
+# zoneAwareReplication disabled — chart's 3-zone model needs 3+ zones;
+# with 2 workers we model it as 2-replica anti-affinity instead.
+
+global:
+  # Applies to all Mimir subcomponents unless overridden.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+# Ingester: 2 replicas, one per worker (anti-affinity required).
+ingester:
+  replicas: 2
+  zoneAwareReplication:
+    enabled: false
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [ingester]
+        topologyKey: kubernetes.io/hostname
+
+# Store-gateway: 2 replicas, anti-affinity.
+store_gateway:
+  replicas: 2
+  zoneAwareReplication:
+    enabled: false
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: app.kubernetes.io/component
+            operator: In
+            values: [store-gateway]
+        topologyKey: kubernetes.io/hostname
+
+# Distributor: 2 replicas. Spread preferred, not required
+# (tolerant of 1 worker being down during rollouts).
+distributor:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values: [distributor]
+          topologyKey: kubernetes.io/hostname
+
+# Querier: 2 replicas spread across workers.
+querier:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values: [querier]
+          topologyKey: kubernetes.io/hostname
+
+# Query-frontend: 2 replicas spread across workers.
+query_frontend:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values: [query-frontend]
+          topologyKey: kubernetes.io/hostname
+
+# Query-scheduler: 2 replicas, worker-only.
+query_scheduler:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+# Single-replica components (compactor, ruler, alertmanager, gateway,
+# overrides_exporter, rollout_operator) — worker-only.
+compactor:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+ruler:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+alertmanager:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+gateway:
+  replicas: 2
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/component
+              operator: In
+              values: [gateway]
+          topologyKey: kubernetes.io/hostname
+
+overrides_exporter:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists
+
+rollout_operator:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node-role.kubernetes.io/worker
+            operator: Exists

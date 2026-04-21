@@ -8,6 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NAMESPACE="${NAMESPACE:-monitoring}"
 DRY_RUN="${DRY_RUN:-false}"
 APISIX_ADMIN_KEY="${APISIX_ADMIN_KEY:-edd1c9f034335f136f87ad84b625c8f1}"
+MIMIR_VALUES_FILE="${MIMIR_VALUES_FILE:-mimir-values.yaml}"
 
 REQUIRED_VARS=(
   KUBECONFIG
@@ -38,10 +39,9 @@ run() {
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-echo "==> Preparing values files in $WORK_DIR"
-for f in mimir-values.yaml grafana-values.yaml; do
-  cp "$SCRIPT_DIR/$f" "$WORK_DIR/$f"
-done
+echo "==> Preparing values files in $WORK_DIR (mimir values: $MIMIR_VALUES_FILE)"
+cp "$SCRIPT_DIR/$MIMIR_VALUES_FILE" "$WORK_DIR/mimir-values.yaml"
+cp "$SCRIPT_DIR/grafana-values.yaml" "$WORK_DIR/grafana-values.yaml"
 
 # Strip scheme — thanos S3 client expects host[:port] only
 MIMIR_S3_ENDPOINT_HOST="${MIMIR_S3_ENDPOINT#https://}"
@@ -80,6 +80,11 @@ run helm repo update
 # Step 2: Namespace
 echo "==> Step 2: Creating namespace $NAMESPACE"
 run kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | run kubectl apply -f -
+
+# Step 2.5: Node sysctl tuning (vm.max_map_count for Mimir ingester mmap fan-out)
+echo "==> Step 2.5: Applying node sysctl DaemonSet"
+run kubectl apply -n "$NAMESPACE" -f "$SCRIPT_DIR/node-sysctl-daemonset.yaml"
+run kubectl -n "$NAMESPACE" rollout status ds/node-sysctl --timeout=2m
 
 # Step 3: Mimir
 echo "==> Step 3: Installing Mimir"

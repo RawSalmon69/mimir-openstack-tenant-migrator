@@ -8,6 +8,11 @@ metadata:
     app.kubernetes.io/component: migration
 spec:
   replicas: 1
+  # Recreate, not RollingUpdate: the old pod holds the TSDB lock file
+  # until asynq drain completes, so a new pod cannot open the shared DB
+  # until the old one exits.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: migrator
@@ -46,7 +51,7 @@ spec:
             - name: WRITER_CONCURRENCY
               value: "4"
             - name: QUEUE_CONCURRENCY
-              value: "1"  # must be 1 — TSDB lock file prevents concurrent opens
+              value: "8"  # Target for 64 GiB / 16 vCPU workers. Drop to 4 or lower on smaller nodes.
             - name: DRY_RUN
               value: "false"
             - name: HISTORY_LOG_PATH
@@ -57,9 +62,12 @@ spec:
             - name: history-log
               mountPath: /var/log/migrator
           resources:
+            # Sized for QUEUE_CONCURRENCY × WRITER_CONCURRENCY in-flight
+            # batches on a 64 GiB / 16 vCPU worker. Scale down for smaller
+            # nodes (and drop QUEUE_CONCURRENCY in lock-step).
             requests:
               cpu: "2"
-              memory: "8Gi"
+              memory: "16Gi"
             limits:
               cpu: "6"
               memory: "28Gi"
@@ -73,12 +81,23 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 2
+          # startupProbe suppresses liveness and readiness failures while
+          # the TSDB WAL replays. 600s ceiling (60 × 10s); tighten after
+          # measuring replay time on your TSDB. Targets /readyz so the
+          # probe succeeds when the shared TSDB open completes.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            failureThreshold: 60
+            periodSeconds: 10
+            timeoutSeconds: 3
       volumes:
         - name: tsdb-data
           hostPath:
@@ -86,4 +105,8 @@ spec:
             type: Directory
         - name: history-log
           emptyDir: {}
+      # Covers the asynq drain budget (ASYNQ_SHUTDOWN_TIMEOUT_SECONDS,
+      # default 100s) plus headroom for TSDB close + HTTP shutdown +
+      # Redis close. K8s default 30s is too short.
+      terminationGracePeriodSeconds: 120
       restartPolicy: Always

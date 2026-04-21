@@ -4,3 +4,16 @@ config:
   tenant:
     default: default
     label: projectId
+
+# Chart default 256Mi limit OOMs under concurrent migrator load
+# (QUEUE_CONCURRENCY × WRITER_CONCURRENCY in-flight remote-write
+# streams). 1Gi absorbs the protobuf decode and forward buffers.
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+replicaCount: 2

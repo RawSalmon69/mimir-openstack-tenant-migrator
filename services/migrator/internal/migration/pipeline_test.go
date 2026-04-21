@@ -7,71 +7,54 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/NIPA-Mimir/services/migrator/internal/tsdb"
 	"github.com/golang/snappy"
-	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
-	promtsdb "github.com/prometheus/prometheus/tsdb"
 
 	proto "github.com/gogo/protobuf/proto"
 )
 
-// createTestTSDB creates a TSDB with known data:
-//
-//	tenant-a: 3 series (cpu_usage, mem_usage, disk_io) × 10 samples each
-//	tenant-b: 2 series (cpu_usage, mem_usage) × 5 samples each
-func createTestTSDB(t *testing.T, dir string) {
-	t.Helper()
-
-	opts := promtsdb.DefaultOptions()
-	opts.RetentionDuration = 0
-	db, err := promtsdb.Open(dir, nil, nil, opts, nil)
-	if err != nil {
-		t.Fatalf("opening TSDB: %v", err)
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Fatalf("closing TSDB: %v", err)
-		}
-	}()
-
+// tenantASeriesData returns the 3 series × 10 samples shape that the
+// pre-refactor on-disk TSDB fixture produced for projectId=tenant-a.
+// Labels are pre-sorted by Name (Reader.Read sort is a no-op here).
+// Mirrors the on-disk fixture's series counts so existing assertions
+// (SeriesRead=3, SamplesRead=30, mock-server samples=30) still hold.
+func tenantASeriesData() []tsdb.SeriesData {
 	type sd struct {
-		name, tenant, instance, job string
-		n                           int
+		name, instance, job string
+		n                   int
 	}
-	series := []sd{
-		{"cpu_usage", "tenant-a", "host-1", "node-exporter", 10},
-		{"mem_usage", "tenant-a", "host-1", "node-exporter", 10},
-		{"disk_io", "tenant-a", "host-2", "node-exporter", 10},
-		{"cpu_usage", "tenant-b", "host-3", "vm-exporter", 5},
-		{"mem_usage", "tenant-b", "host-3", "vm-exporter", 5},
+	specs := []sd{
+		{"cpu_usage", "host-1", "node-exporter", 10},
+		{"mem_usage", "host-1", "node-exporter", 10},
+		{"disk_io", "host-2", "node-exporter", 10},
 	}
-
-	baseTime := int64(1735689600000) // 2025-01-01T00:00:00Z
-	app := db.Appender(context.Background())
-	for _, s := range series {
-		lbls := labels.FromStrings(
-			"__name__", s.name,
-			"instance", s.instance,
-			"job", s.job,
-			"projectId", s.tenant,
-		)
-		for i := 0; i < s.n; i++ {
-			ts := baseTime + int64(i*30_000)
-			if _, err := app.Append(0, lbls, ts, float64(i)*1.5); err != nil {
-				t.Fatalf("appending sample: %v", err)
-			}
+	baseTime := int64(1735689600000) // 2025-01-01T00:00:00Z, matches pre-refactor fixture
+	out := make([]tsdb.SeriesData, 0, len(specs))
+	for _, s := range specs {
+		// Labels MUST be sorted by Name (Mimir contract; Reader.Read enforces it).
+		// Pre-sort here so the fake's output matches what the real Reader would emit.
+		lbls := []prompb.Label{
+			{Name: "__name__", Value: s.name},
+			{Name: "instance", Value: s.instance},
+			{Name: "job", Value: s.job},
+			{Name: "projectId", Value: "tenant-a"},
 		}
+		samples := make([]prompb.Sample, 0, s.n)
+		for i := 0; i < s.n; i++ {
+			samples = append(samples, prompb.Sample{
+				Timestamp: baseTime + int64(i*30_000),
+				Value:     float64(i) * 1.5,
+			})
+		}
+		out = append(out, tsdb.SeriesData{Labels: lbls, Samples: samples})
 	}
-	if err := app.Commit(); err != nil {
-		t.Fatalf("committing: %v", err)
-	}
-	if err := db.Compact(context.Background()); err != nil {
-		t.Fatalf("compacting: %v", err)
-	}
+	return out
 }
 
 // mockRemoteWriteServer returns an httptest.Server that decodes remote write
@@ -119,15 +102,12 @@ func testLogger() *slog.Logger {
 }
 
 func TestPipelineEndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	counter := &writeCounter{}
 	srv := newMockServer(t, counter)
 	defer srv.Close()
 
 	stats, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 		TenantID:          "tenant-a",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     5 * 1024 * 1024,
@@ -163,9 +143,6 @@ func TestPipelineEndToEnd(t *testing.T) {
 //   - Generous budget packs all 3 series into a single request.
 //   - Tiny budget forces per-sample splitting across many requests.
 func TestPipelineByteBudget(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	// Sub-case 1: generous budget — all 3 series × 10 samples should pack
 	// into a single remote write request (key slice success criterion).
 	t.Run("generous_budget", func(t *testing.T) {
@@ -174,7 +151,7 @@ func TestPipelineByteBudget(t *testing.T) {
 		defer srv.Close()
 
 		_, err := Run(context.Background(), PipelineConfig{
-			TSDBPath:          dir,
+			Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 			TenantID:          "tenant-a",
 			CortexURL:         srv.URL,
 			MaxBatchBytes:     10 * 1024 * 1024, // 10 MiB — trivially large
@@ -208,7 +185,7 @@ func TestPipelineByteBudget(t *testing.T) {
 		defer srv.Close()
 
 		_, err := Run(context.Background(), PipelineConfig{
-			TSDBPath:          dir,
+			Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 			TenantID:          "tenant-a",
 			CortexURL:         srv.URL,
 			MaxBatchBytes:     128, // forces split path: ~259B series → ~2 chunks each
@@ -232,15 +209,12 @@ func TestPipelineByteBudget(t *testing.T) {
 // TestPipelineBatchSplitting verifies the oversize-series split path using a
 // tiny MaxBatchBytes budget instead of the legacy BatchSize knob.
 func TestPipelineBatchSplitting(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	counter := &writeCounter{}
 	srv := newMockServer(t, counter)
 	defer srv.Close()
 
 	stats, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 		TenantID:          "tenant-a",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     128, // tiny budget: ~259B series → split into multiple chunks
@@ -267,15 +241,12 @@ func TestPipelineBatchSplitting(t *testing.T) {
 }
 
 func TestPipelineDryRun(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	counter := &writeCounter{}
 	srv := newMockServer(t, counter)
 	defer srv.Close()
 
 	stats, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 		TenantID:          "tenant-a",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     5 * 1024 * 1024,
@@ -299,9 +270,6 @@ func TestPipelineDryRun(t *testing.T) {
 }
 
 func TestPipelineProgressCallback(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	counter := &writeCounter{}
 	srv := newMockServer(t, counter)
 	defer srv.Close()
@@ -310,7 +278,7 @@ func TestPipelineProgressCallback(t *testing.T) {
 	var calls []int // series counts recorded by callback
 
 	_, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 		TenantID:          "tenant-a",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     5 * 1024 * 1024,
@@ -340,9 +308,6 @@ func TestPipelineProgressCallback(t *testing.T) {
 // --- Negative / error path tests ---
 
 func TestPipelineWriterError(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	// Server that always returns 500.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -351,7 +316,7 @@ func TestPipelineWriterError(t *testing.T) {
 	defer srv.Close()
 
 	_, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: tenantASeriesData()},
 		TenantID:          "tenant-a",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     5 * 1024 * 1024,
@@ -365,9 +330,6 @@ func TestPipelineWriterError(t *testing.T) {
 }
 
 func TestPipelineNoMatchingSeries(t *testing.T) {
-	dir := t.TempDir()
-	createTestTSDB(t, dir)
-
 	var reqCount atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqCount.Add(1)
@@ -376,7 +338,7 @@ func TestPipelineNoMatchingSeries(t *testing.T) {
 	defer srv.Close()
 
 	stats, err := Run(context.Background(), PipelineConfig{
-		TSDBPath:          dir,
+		Provider:          &tsdb.FakeProvider{Series: nil},
 		TenantID:          "nonexistent-tenant",
 		CortexURL:         srv.URL,
 		MaxBatchBytes:     5 * 1024 * 1024,
@@ -394,5 +356,25 @@ func TestPipelineNoMatchingSeries(t *testing.T) {
 	}
 	if reqCount.Load() != 0 {
 		t.Errorf("server received %d requests for nonexistent tenant, want 0", reqCount.Load())
+	}
+}
+
+// TestPipelineRequiresProvider validates the nil-Provider contract introduced
+// in Task 2-01-01: callers MUST inject a non-nil QuerierProvider, and the
+// pipeline must fail fast with a typed error before any goroutine spawns.
+func TestPipelineRequiresProvider(t *testing.T) {
+	_, err := Run(context.Background(), PipelineConfig{
+		Provider:          nil,
+		TenantID:          "tenant-a",
+		CortexURL:         "http://unused.test",
+		MaxBatchBytes:     5 * 1024 * 1024,
+		WriterConcurrency: 1,
+	}, nil, testLogger())
+	if err == nil {
+		t.Fatal("expected error when cfg.Provider is nil, got nil")
+	}
+	// Error message contract — callers rely on the literal string.
+	if !strings.Contains(err.Error(), "Provider is required") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "Provider is required")
 	}
 }

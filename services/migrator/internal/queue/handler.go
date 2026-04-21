@@ -5,19 +5,26 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/NIPA-Mimir/services/migrator/internal/migration"
+	"github.com/NIPA-Mimir/services/migrator/internal/tsdb"
 	"github.com/hibiken/asynq"
 )
 
-// MigrationHandler processes migrate:tenant tasks via asynq.
+// MigrationHandler processes migrate:tenant tasks via asynq. OpenProvider
+// returns a QuerierProvider for one ProcessTask call; the closer is
+// deferred inside ProcessTask. In server mode the closure returns the
+// shared *tsdb.DB with a no-op closer — the DB lifecycle is owned by
+// main().
 type MigrationHandler struct {
-	Store   *ProgressStore
-	Logger  *slog.Logger
-	History *HistoryLogger
+	Store        *ProgressStore
+	Logger       *slog.Logger
+	History      *HistoryLogger
+	OpenProvider func(path string) (tsdb.QuerierProvider, io.Closer, error)
 }
 
 // ProcessTask implements asynq.Handler. It parses the task payload,
@@ -41,8 +48,40 @@ func (h *MigrationHandler) ProcessTask(ctx context.Context, task *asynq.Task) er
 		logger.Warn("failed to update progress on start", "err", uErr)
 	}
 
+	if h.OpenProvider == nil {
+		return fmt.Errorf("handler: OpenProvider is nil")
+	}
+
+	provider, closer, oErr := h.OpenProvider(payload.TSDBPath)
+	if oErr != nil {
+		// Mirror the migration-failed bookkeeping so a TSDB-open failure is
+		// observable in Redis + history exactly like a remote-write failure.
+		if uErr := h.Store.Update(ctx, taskID, map[string]interface{}{
+			"state": "failed",
+			"error": oErr.Error(),
+		}); uErr != nil {
+			logger.Warn("failed to update progress on open failure", "err", uErr)
+		}
+		if hErr := h.History.Append(HistoryEntry{
+			TaskID:    taskID,
+			ProjectID: payload.ProjectID,
+			State:     "failed",
+			StartedAt: startedAt,
+			EndedAt:   time.Now().UTC(),
+			Error:     oErr.Error(),
+		}); hErr != nil {
+			logger.Warn("history append failed", "err", hErr)
+		}
+		return fmt.Errorf("open tsdb %s: %w", payload.ProjectID, oErr)
+	}
+	defer func() {
+		if cErr := closer.Close(); cErr != nil {
+			logger.Warn("closing TSDB provider", "err", cErr)
+		}
+	}()
+
 	cfg := migration.PipelineConfig{
-		TSDBPath:          payload.TSDBPath,
+		Provider:          provider,
 		TenantID:          payload.ProjectID,
 		CortexURL:         payload.CortexURL,
 		MaxBatchBytes:     payload.MaxBatchBytes,

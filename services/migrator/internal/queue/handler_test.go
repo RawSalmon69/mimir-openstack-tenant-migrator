@@ -22,7 +22,18 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	proto "github.com/gogo/protobuf/proto"
+
+	"github.com/NIPA-Mimir/services/migrator/internal/tsdb"
 )
+
+// realOpenProvider returns the production tsdb.OpenProvider closure used in
+// tests so handler tests exercise the full read pipeline against the real
+// fixture TSDB created by createTestTSDB.
+func realOpenProvider(logger *slog.Logger) func(string) (tsdb.QuerierProvider, io.Closer, error) {
+	return func(path string) (tsdb.QuerierProvider, io.Closer, error) {
+		return tsdb.OpenProvider(path, logger)
+	}
+}
 
 // --- Test helpers (duplicated from migration package, unexported there) ---
 
@@ -119,9 +130,11 @@ func newTestHandler(t *testing.T, mr *miniredis.Miniredis) (*MigrationHandler, *
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
 	store := NewProgressStore(rdb)
+	logger := testLogger()
 	handler := &MigrationHandler{
-		Store:  store,
-		Logger: testLogger(),
+		Store:        store,
+		Logger:       logger,
+		OpenProvider: realOpenProvider(logger),
 	}
 	return handler, store
 }
@@ -283,10 +296,12 @@ func TestProcessTaskWritesHistory(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
 	store := NewProgressStore(rdb)
+	logger := testLogger()
 	handler := &MigrationHandler{
-		Store:   store,
-		Logger:  testLogger(),
-		History: histLogger,
+		Store:        store,
+		Logger:       logger,
+		History:      histLogger,
+		OpenProvider: realOpenProvider(logger),
 	}
 
 	task := makeTask(t, MigratePayload{

@@ -24,6 +24,23 @@ mimir:
     compactor:
       cleanup_interval: 1m  # default 15m — matches bucket_store sync
 
+    # Use all available cores for ingester WAL replay at startup. Chart
+    # default is 3 which bottlenecks recovery time when many tenants'
+    # TSDBs are on disk. 0 = GOMAXPROCS (upstream default).
+    blocks_storage:
+      tsdb:
+        wal_replay_concurrency: 0
+
+    # Lift global ingestion and OOO defaults so bulk migration does not
+    # depend on per-tenant runtime_config reload (fsnotify reload can
+    # exceed 45s on chart v6.0.6). Safe because the migrator is the
+    # only writer during migration.
+    limits:
+      ingestion_rate: 10000000        # 10M samples/s (default 10K)
+      ingestion_burst_size: 20000000  # 20M burst      (default 200K)
+      out_of_order_time_window: 2880h # 120 days       (default 0h)
+      max_global_series_per_user: 0   # unlimited      (default 150K) — bulk migration loads full history
+
     ruler_storage:
       s3:
         bucket_name: "${MIMIR_S3_BUCKET_RULER}"
@@ -45,3 +62,75 @@ kafka:
       value: "104857600"
     - name: KAFKA_SOCKET_REQUEST_MAX_BYTES
       value: "104857600"
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+# 2-node profile: disable zone-aware replication and pin every Mimir
+# pod to the worker so the master retains its control plane and
+# ancillary services (redis). The chart's default zone-aware HA
+# expects 3+ nodes; use deploy/mimir-values-3node.yaml for that.
+
+global:
+  # Pin everything (mimir components) to the worker so control plane
+  # stays isolated on master.
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+ingester:
+  replicas: 1
+  zoneAwareReplication:
+    enabled: false
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+store_gateway:
+  replicas: 1
+  zoneAwareReplication:
+    enabled: false
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+distributor:
+  replicas: 1
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+querier:
+  replicas: 1
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+query_frontend:
+  replicas: 1
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+query_scheduler:
+  replicas: 1
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+compactor:
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+ruler:
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+alertmanager:
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+gateway:
+  replicas: 1
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+overrides_exporter:
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1
+
+rollout_operator:
+  nodeSelector:
+    kubernetes.io/hostname: kp-k8s-worker-1

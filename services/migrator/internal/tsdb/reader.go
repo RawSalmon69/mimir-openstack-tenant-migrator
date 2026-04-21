@@ -18,9 +18,12 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
-// ReaderConfig controls which data the reader selects from a TSDB.
+// ReaderConfig controls which data the reader selects. TSDBPath is consumed
+// only by ReaderFromPath and by the NewReader path-fallback codepath; the
+// injection codepath (NewReaderWithProvider) ignores TSDBPath.
 type ReaderConfig struct {
-	// TSDBPath is the filesystem path to the TSDB directory.
+	// TSDBPath is the filesystem path to the TSDB directory. Consumed only by
+	// ReaderFromPath and by the NewReader path-fallback codepath.
 	TSDBPath string
 	// TenantID is the value of the "projectId" label to filter on.
 	// An empty string means "match all series" (no projectId filter).
@@ -38,46 +41,46 @@ type SeriesData struct {
 	Samples []prompb.Sample
 }
 
-// Reader reads filtered series from a Prometheus TSDB directory. It is
-// single-goroutine: callers must not invoke Read concurrently on the same
-// Reader.
+// Reader reads filtered series from a QuerierProvider. It is single-goroutine:
+// callers must not invoke Read concurrently on the same Reader. A Reader
+// constructed with NewReader has a nil provider and will open the TSDB at
+// cfg.TSDBPath inside Read (path-fallback mode). A Reader constructed with
+// NewReaderWithProvider uses the injected provider and never touches
+// cfg.TSDBPath.
 type Reader struct {
-	cfg    ReaderConfig
-	logger *slog.Logger
+	provider QuerierProvider
+	cfg      ReaderConfig
+	logger   *slog.Logger
 }
 
-// NewReader creates a Reader with the given config.
+// NewReader creates a Reader in path-fallback mode. Its Read method opens the
+// TSDB at cfg.TSDBPath on each call. Prefer NewReaderWithProvider — the
+// path-fallback codepath exists only for callers that cannot inject a
+// provider.
 func NewReader(cfg ReaderConfig, logger *slog.Logger) *Reader {
-	return &Reader{cfg: cfg, logger: logger}
+	return &Reader{provider: nil, cfg: cfg, logger: logger}
 }
 
-// Read opens the TSDB, queries series matching the configured projectId,
-// and sends each series as a SeriesData value on ch. The channel is NOT
-// closed by Read — the caller owns channel lifecycle.
+// NewReaderWithProvider creates a Reader backed by an injected QuerierProvider.
+// The Reader does not own the provider's lifecycle — callers must manage any
+// underlying resources (e.g. *tsdb.DB.Close) themselves. Each Read call opens
+// and closes its own per-call storage.Querier via provider.Querier(mint, maxt).
+func NewReaderWithProvider(provider QuerierProvider, cfg ReaderConfig, logger *slog.Logger) *Reader {
+	return &Reader{provider: provider, cfg: cfg, logger: logger}
+}
+
+// Read opens a per-call querier from the Reader's QuerierProvider, queries
+// series matching the configured projectId, and sends each series as a
+// SeriesData value on ch. The channel is NOT closed by Read — the caller owns
+// channel lifecycle.
 //
 // Read returns nil when all matching series have been sent, or an error
-// if the TSDB cannot be opened / queried. It respects ctx cancellation
+// if the querier cannot be created / iterated. It respects ctx cancellation
 // and will return ctx.Err() if the context is cancelled mid-iteration.
+//
+// If the Reader was constructed via NewReader (nil provider), Read opens the
+// TSDB at cfg.TSDBPath for the duration of this call and closes it on return.
 func (r *Reader) Read(ctx context.Context, ch chan<- SeriesData) error {
-	if _, err := os.Stat(r.cfg.TSDBPath); err != nil {
-		return fmt.Errorf("tsdb path %q: %w", r.cfg.TSDBPath, err)
-	}
-
-	// tsdb.Open replays the WAL into memory and never hardlinks files, so it
-	// is safe when the TSDB lives on a separate filesystem from /tmp.
-	// RetentionDuration=0 disables auto-deletion.
-	opts := promtsdb.DefaultOptions()
-	opts.RetentionDuration = 0
-	db, err := promtsdb.Open(r.cfg.TSDBPath, r.logger, nil, opts, nil)
-	if err != nil {
-		return fmt.Errorf("opening TSDB at %q: %w", r.cfg.TSDBPath, err)
-	}
-	defer func() {
-		if cerr := db.Close(); cerr != nil {
-			r.logger.Warn("closing TSDB", "err", cerr)
-		}
-	}()
-
 	minT, maxT := r.cfg.MinTime, r.cfg.MaxTime
 	if minT == 0 {
 		minT = math.MinInt64
@@ -86,7 +89,29 @@ func (r *Reader) Read(ctx context.Context, ch chan<- SeriesData) error {
 		maxT = math.MaxInt64
 	}
 
-	querier, err := db.Querier(minT, maxT)
+	provider := r.provider
+	if provider == nil {
+		if _, err := os.Stat(r.cfg.TSDBPath); err != nil {
+			return fmt.Errorf("tsdb path %q: %w", r.cfg.TSDBPath, err)
+		}
+		// tsdb.Open replays the WAL into memory and never hardlinks files, so it
+		// is safe when the TSDB lives on a separate filesystem from /tmp.
+		// RetentionDuration=0 disables auto-deletion.
+		opts := promtsdb.DefaultOptions()
+		opts.RetentionDuration = 0
+		db, err := promtsdb.Open(r.cfg.TSDBPath, r.logger, nil, opts, nil)
+		if err != nil {
+			return fmt.Errorf("opening TSDB at %q: %w", r.cfg.TSDBPath, err)
+		}
+		defer func() {
+			if cerr := db.Close(); cerr != nil {
+				r.logger.Warn("closing TSDB", "err", cerr)
+			}
+		}()
+		provider = db
+	}
+
+	querier, err := provider.Querier(minT, maxT)
 	if err != nil {
 		return fmt.Errorf("creating querier [%d, %d]: %w", minT, maxT, err)
 	}

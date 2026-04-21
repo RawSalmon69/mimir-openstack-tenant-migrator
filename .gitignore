@@ -35,14 +35,21 @@ tmp/
 *_RC_file*.sh
 *_rc_file*.sh
 
-# GSD and local tooling state (project-specific planning, not code)
+# Local tooling and planning state
+.planning/
 .gsd
 .gsd-id
 .gsd-local/
-.planning/
 .bg-shell/
 gsd-session-*.html
+CLAUDE.md
+.claude/
 
-# Go build artifacts from local runs
+PRODUCTION-NUMBERS.md
+migration-*.md
+migration-*.csv
+project_id.csv
+
+# Go build artifacts
 services/migrator/revert-overrides
 services/migrator/migrator

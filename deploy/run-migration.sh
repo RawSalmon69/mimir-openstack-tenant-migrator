@@ -40,6 +40,56 @@ require() {
   fi
 }
 
+# wait_for_runtime_reload polls a Mimir distributor pod's /runtime_config
+# endpoint until the given tenant's override key appears (signal that the
+# patched ConfigMap has been picked up via fsnotify), or until the timeout
+# ceiling elapses. A fast reload exits early; a stalled Mimir hits the
+# ceiling and logs a warning instead of hanging silently.
+#
+# Args:
+#   $1 — sentinel tenant id (any one of the patched tenants; first appearance
+#        in the YAML response indicates the reload propagated).
+#   $2 — ceiling in seconds (defaults to RUNTIME_RELOAD_WAIT_SECS=45).
+wait_for_runtime_reload() {
+  local sentinel_tenant="$1"
+  local ceiling="${2:-45}"
+  local interval=2
+  local elapsed=0
+
+  # Pick a Mimir distributor pod via standard label selector. Fall back to
+  # querier if no distributor exists; fall back to blind sleep if neither.
+  local pod
+  pod=$(kubectl -n "$NAMESPACE" get pods \
+    -l app.kubernetes.io/name=mimir,app.kubernetes.io/component=distributor \
+    -o name 2>/dev/null | head -1)
+  if [ -z "$pod" ]; then
+    pod=$(kubectl -n "$NAMESPACE" get pods \
+      -l app.kubernetes.io/name=mimir,app.kubernetes.io/component=querier \
+      -o name 2>/dev/null | head -1)
+  fi
+  if [ -z "$pod" ]; then
+    echo "  ⚠ no Mimir distributor/querier pod found — falling back to blind ${ceiling}s sleep"
+    sleep "$ceiling"
+    return 0
+  fi
+
+  while [ "$elapsed" -lt "$ceiling" ]; do
+    # Mimir's /runtime_config returns the merged YAML; the first match for
+    # ^<tenant>:  in the overrides block confirms the reload propagated.
+    if kubectl -n "$NAMESPACE" exec "$pod" -- \
+        wget -qO- http://localhost:8080/runtime_config 2>/dev/null \
+        | grep -qE "^[[:space:]]+${sentinel_tenant}:[[:space:]]*$"; then
+      echo "  ✓ tenant override visible to Mimir after ${elapsed}s (sentinel: $sentinel_tenant)"
+      return 0
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
+
+  echo "  ⚠ Mimir runtime_config reload did not appear within ${ceiling}s — proceeding anyway; tenants may briefly see DEFAULT overrides" >&2
+  return 0
+}
+
 start_port_forward() {
   # Port-forward to migrator and wait for /healthz.
   kubectl -n "$NAMESPACE" port-forward "deploy/$MIGRATOR_DEPLOYMENT" \
@@ -181,8 +231,8 @@ cmd_run() {
     echo "  tenants: ${tenants[0]} ${tenants[1]} ${tenants[2]} ... (${#tenants[@]} total)"
   fi
 
-  echo "→ Waiting ${RUNTIME_RELOAD_WAIT_SECS}s for Mimir runtime_config reload..."
-  sleep "$RUNTIME_RELOAD_WAIT_SECS"
+  echo "→ Polling Mimir runtime_config (timeout ${RUNTIME_RELOAD_WAIT_SECS}s) for tenant override visibility..."
+  wait_for_runtime_reload "${tenants[0]}" "$RUNTIME_RELOAD_WAIT_SECS"
 
   echo "→ Starting port-forward to deploy/$MIGRATOR_DEPLOYMENT on :$PORT_FORWARD_PORT..."
   start_port_forward

@@ -40,7 +40,11 @@ func NewWriter(cfg WriterConfig, logger *slog.Logger) *Writer {
 	}
 
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: 10,
+		// 32 idle conns per host accommodates QC × writer fan-out with
+		// headroom. MaxConnsPerHost is left unset due to a known panic in
+		// Go < 1.25.2; revisit when the toolchain is upgraded.
+		MaxIdleConnsPerHost: 32,
+		MaxIdleConns:        100,
 		IdleConnTimeout:     90 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,

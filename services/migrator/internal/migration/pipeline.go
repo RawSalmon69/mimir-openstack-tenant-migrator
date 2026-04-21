@@ -15,9 +15,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// PipelineConfig controls the migration pipeline.
+// PipelineConfig controls the migration pipeline. The caller owns the
+// QuerierProvider lifecycle and must Close it after Run returns.
 type PipelineConfig struct {
-	TSDBPath          string
+	Provider          tsdb.QuerierProvider
 	TenantID          string
 	CortexURL         string
 	MaxBatchBytes     int // Maximum encoded byte size per remote write request (default 3 MiB).
@@ -45,6 +46,10 @@ type ProgressFunc func(seriesRead int, samplesRead int)
 func Run(ctx context.Context, cfg PipelineConfig, progress ProgressFunc, logger *slog.Logger) (PipelineStats, error) {
 	start := time.Now()
 
+	if cfg.Provider == nil {
+		return PipelineStats{}, fmt.Errorf("pipeline: cfg.Provider is required")
+	}
+
 	if cfg.MaxBatchBytes <= 0 {
 		// 3 MiB keeps 25% headroom under Mimir's 4 MiB request body limit.
 		cfg.MaxBatchBytes = 3 * 1024 * 1024
@@ -67,8 +72,7 @@ func Run(ctx context.Context, cfg PipelineConfig, progress ProgressFunc, logger 
 
 	g.Go(func() error {
 		defer close(seriesCh)
-		reader := tsdb.NewReader(tsdb.ReaderConfig{
-			TSDBPath: cfg.TSDBPath,
+		reader := tsdb.NewReaderWithProvider(cfg.Provider, tsdb.ReaderConfig{
 			TenantID: cfg.TenantID,
 			MinTime:  cfg.MinTime,
 			MaxTime:  cfg.MaxTime,

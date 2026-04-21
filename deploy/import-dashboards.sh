@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # import-dashboards.sh — Import Grafana dashboards via port-forward.
-# Required: GRAFANA_ADMIN_PASSWORD
+# Uses the auth.proxy X-GRAFANAAUTH-USER: admin header (chart config has
+# disable_login_form: true which blocks basic auth for API calls — this
+# is the same path production Keystone users take, just as "admin").
 
 set -euo pipefail
 
@@ -10,12 +12,12 @@ GRAFANA_DS_UID="${GRAFANA_DS_UID:-mimir-tenant}"
 LOCAL_PORT="${LOCAL_PORT:-3000}"
 DASHBOARD_DIR="$SCRIPT_DIR/../grafana-monitor-system-main-grafana-dashboards-general/grafana/dashboards/general"
 
-if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
-  echo "ERROR: GRAFANA_ADMIN_PASSWORD is required" >&2
-  exit 1
-fi
-
-GRAFANA_URL="http://admin:${GRAFANA_ADMIN_PASSWORD}@localhost:${LOCAL_PORT}"
+GRAFANA_URL="http://localhost:${LOCAL_PORT}"
+# Grafana is deployed with auth.proxy enabled (X-GRAFANAAUTH-USER header) +
+# disable_login_form: true. Basic auth returns 302 to /login for API calls.
+# Import must use the auth-proxy header; "admin" is the Grafana admin user
+# created by the chart with --set adminPassword, inheriting Org Admin rights.
+AUTH_HEADER="X-GRAFANAAUTH-USER: admin"
 
 # ── Start port-forward ──────────────────────────────────────────────────────
 echo "==> Starting kubectl port-forward to Grafana on localhost:${LOCAL_PORT}"
@@ -23,11 +25,11 @@ kubectl -n "$NAMESPACE" port-forward svc/grafana "${LOCAL_PORT}:80" &
 PF_PID=$!
 trap 'kill $PF_PID 2>/dev/null || true' EXIT
 
-# Wait for port-forward to be ready
-echo "  Waiting for port-forward..."
+# Wait for port-forward + auth-proxy handshake to be ready
+echo "  Waiting for Grafana..."
 for i in $(seq 1 30); do
-  if curl -sf "${GRAFANA_URL}/api/health" >/dev/null 2>&1; then
-    echo "  Grafana reachable."
+  if curl -sf -H "$AUTH_HEADER" "${GRAFANA_URL}/api/user" >/dev/null 2>&1; then
+    echo "  Grafana reachable (auth-proxy accepted admin)."
     break
   fi
   if [[ $i -eq 30 ]]; then
@@ -39,10 +41,10 @@ done
 
 # ── Ensure datasource exists ───────────────────────────────────────────────
 echo "==> Checking/creating datasource '${GRAFANA_DS_UID}'"
-DS_EXISTS=$(curl -sf "${GRAFANA_URL}/api/datasources/uid/${GRAFANA_DS_UID}" -o /dev/null -w '%{http_code}' || echo "000")
+DS_EXISTS=$(curl -sf -H "$AUTH_HEADER" "${GRAFANA_URL}/api/datasources/uid/${GRAFANA_DS_UID}" -o /dev/null -w '%{http_code}' || echo "000")
 if [[ "$DS_EXISTS" != "200" ]]; then
   echo "  Datasource not found, creating..."
-  curl -sf -X POST "${GRAFANA_URL}/api/datasources" \
+  curl -sf -X POST -H "$AUTH_HEADER" "${GRAFANA_URL}/api/datasources" \
     -H "Content-Type: application/json" \
     -d "{
       \"name\": \"Prometheus-Prod\",
@@ -115,15 +117,29 @@ payload = {
 print(json.dumps(payload))
 " > "$PAYLOAD_FILE"
 
-  RESP=$(curl -sf -X POST "${GRAFANA_URL}/api/dashboards/import" \
+  # POST + validate response body actually contains imported:true.
+  # `curl -sf` accepts 302 redirects to /login as success, so import
+  # must be verified by parsing the response body.
+  RESP=$(curl -sS -X POST -H "$AUTH_HEADER" "${GRAFANA_URL}/api/dashboards/import" \
     -H "Content-Type: application/json" \
-    -d @"$PAYLOAD_FILE" 2>&1) && {
-    echo "    OK: $(echo "$RESP" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("slug","imported"))' 2>/dev/null || echo 'imported')"
+    -d @"$PAYLOAD_FILE" 2>&1)
+
+  OK=$(echo "$RESP" | python3 -c 'import json,sys
+try:
+    d=json.loads(sys.stdin.read())
+    print("yes" if d.get("imported") is True and d.get("slug") else "no")
+except Exception:
+    print("no")
+' 2>/dev/null)
+
+  if [[ "$OK" == "yes" ]]; then
+    SLUG=$(echo "$RESP" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("slug",""))')
+    echo "    OK: $SLUG"
     IMPORTED=$((IMPORTED + 1))
-  } || {
-    echo "    FAILED: $db_file"
+  else
+    echo "    FAILED: $db_file — response: $(echo "$RESP" | head -c 200)"
     FAILED=$((FAILED + 1))
-  }
+  fi
   rm -f "$PAYLOAD_FILE"
 done
 

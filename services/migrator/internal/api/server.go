@@ -44,6 +44,10 @@ type ServerConfig struct {
 	WriterConcurrency int
 	DryRun            bool
 	Logger            *slog.Logger
+	// ReadinessFunc reports whether the server is ready to serve traffic.
+	// Wired in cmd/server/main.go to flip true after the shared TSDB
+	// opens. If nil, /readyz defaults to 200.
+	ReadinessFunc func() bool
 }
 
 // noopApplier is a package-local fallback so the server can always call
@@ -88,6 +92,9 @@ func NewServer(cfg ServerConfig) *http.ServeMux {
 	if cfg.Inspector == nil {
 		cfg.Inspector = noopInspector{}
 	}
+	if cfg.ReadinessFunc == nil {
+		cfg.ReadinessFunc = func() bool { return true }
+	}
 
 	mux := http.NewServeMux()
 
@@ -96,6 +103,15 @@ func NewServer(cfg ServerConfig) *http.ServeMux {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		if !cfg.ReadinessFunc() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte("not ready"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
 	})
 	mux.HandleFunc("POST /migrate", h.handleMigrate)
 	mux.HandleFunc("GET /status", h.handleStatus)
