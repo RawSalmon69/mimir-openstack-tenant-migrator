@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: disk-watchdog
+  namespace: monitoring
+---
+# Read kubelet /stats/summary on every node to get per-node disk usage.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: disk-watchdog-node-stats
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: disk-watchdog-node-stats
+subjects:
+  - kind: ServiceAccount
+    name: disk-watchdog
+    namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: disk-watchdog-node-stats
+  apiGroup: rbac.authorization.k8s.io
+---
+# Scale the migrator deployment when the disk threshold trips.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: disk-watchdog-scale
+  namespace: monitoring
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: disk-watchdog-scale
+  namespace: monitoring
+subjects:
+  - kind: ServiceAccount
+    name: disk-watchdog
+    namespace: monitoring
+roleRef:
+  kind: Role
+  name: disk-watchdog-scale
+  apiGroup: rbac.authorization.k8s.io
+---
+# Every minute: poll all node filesystems; if any exceeds DISK_THRESHOLD_PCT,
+# scale the migrator deployment to 0 so Kafka + ingester can drain without
+# further incoming writes. Operator resumes manually via
+# `kubectl -n monitoring scale deploy/migrator --replicas=1`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: disk-watchdog
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: disk-watchdog
+    app.kubernetes.io/component: migration-safety
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 45
+      template:
+        spec:
+          serviceAccountName: disk-watchdog
+          restartPolicy: Never
+          containers:
+            - name: watchdog
+              image: alpine/k8s:1.30.3
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: DISK_PAUSE_PCT
+                  value: "80"
+                - name: DISK_RESUME_PCT
+                  value: "65"
+                - name: TARGET_NAMESPACE
+                  value: monitoring
+                - name: TARGET_DEPLOY
+                  value: migrator
+              resources:
+                requests: {cpu: 10m, memory: 32Mi}
+                limits:   {cpu: 100m, memory: 128Mi}
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -u
+                  max=0
+                  worst=""
+                  for node in $(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+                    pct=$(kubectl get --raw "/api/v1/nodes/${node}/proxy/stats/summary" 2>/dev/null \
+                      | jq -r '.node.fs | ((.usedBytes/.capacityBytes)*100) | floor' 2>/dev/null)
+                    pct=${pct:-0}
+                    echo "$(date -u +%FT%TZ) node=${node} disk=${pct}%"
+                    [ "$pct" -gt "$max" ] && { max=$pct; worst=$node; }
+                  done
+                  cur=$(kubectl -n "$TARGET_NAMESPACE" get deploy "$TARGET_DEPLOY" -o jsonpath='{.spec.replicas}' 2>/dev/null)
+                  paused_by=$(kubectl -n "$TARGET_NAMESPACE" get deploy "$TARGET_DEPLOY" -o jsonpath='{.metadata.annotations.disk-watchdog/paused-at}' 2>/dev/null)
+                  if [ "$max" -ge "$DISK_PAUSE_PCT" ] && [ "${cur:-0}" -gt 0 ]; then
+                    echo "$(date -u +%FT%TZ) PAUSE: ${worst} at ${max}% >= ${DISK_PAUSE_PCT}% — scaling ${TARGET_DEPLOY} to 0"
+                    kubectl -n "$TARGET_NAMESPACE" scale deploy/"$TARGET_DEPLOY" --replicas=0
+                    kubectl -n "$TARGET_NAMESPACE" annotate deploy/"$TARGET_DEPLOY" \
+                      disk-watchdog/paused-at="$(date -u +%FT%TZ)" \
+                      disk-watchdog/pause-reason="disk=${max}%@${worst}" \
+                      --overwrite
+                  elif [ "$max" -le "$DISK_RESUME_PCT" ] && [ "${cur:-0}" -eq 0 ] && [ -n "$paused_by" ]; then
+                    echo "$(date -u +%FT%TZ) RESUME: worst disk ${max}% <= ${DISK_RESUME_PCT}% — scaling ${TARGET_DEPLOY} to 1 (was paused at ${paused_by})"
+                    kubectl -n "$TARGET_NAMESPACE" scale deploy/"$TARGET_DEPLOY" --replicas=1
+                    kubectl -n "$TARGET_NAMESPACE" annotate deploy/"$TARGET_DEPLOY" \
+                      disk-watchdog/paused-at- \
+                      disk-watchdog/pause-reason- \
+                      disk-watchdog/resumed-at="$(date -u +%FT%TZ)" \
+                      --overwrite
+                  fi

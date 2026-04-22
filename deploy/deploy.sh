@@ -157,6 +157,10 @@ for i in $(seq 0 $((NUM_ROUTES - 1))); do
   fi
 done
 
+# Step 10.5: Disk watchdog (pauses migrator at 80% disk to prevent WAL-fill cascades)
+echo "==> Step 10.5: Applying disk-watchdog CronJob"
+run kubectl apply -n "$NAMESPACE" -f "$SCRIPT_DIR/disk-watchdog.yaml"
+
 # Step 11: Migrator
 echo "==> Step 11: Applying migrator RBAC and Deployment"
 run kubectl apply -n "$NAMESPACE" -f "$SCRIPT_DIR/migrator-rbac.yaml"
